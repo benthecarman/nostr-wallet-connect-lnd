@@ -1,3 +1,5 @@
+use crate::config::Config;
+use crate::nip47::Nip47Request;
 use bitcoin::hashes::hex::ToHex;
 use clap::Parser;
 use lightning_invoice::Invoice;
@@ -5,19 +7,13 @@ use nostr::prelude::*;
 use nostr::Keys;
 use nostr_sdk::relay::pool::RelayPoolNotification::*;
 use nostr_sdk::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Write};
 use std::path::Path;
-use tonic_openssl_lnd::lnrpc::payment::PaymentStatus;
-use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse, PaymentFailureReason};
-use tonic_openssl_lnd::LndRouterClient;
-
-use anyhow::anyhow;
-use serde::{Deserialize, Serialize};
-
-use crate::config::Config;
-use crate::nip47::Nip47Request;
+use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse};
+use tonic_openssl_lnd::LndLightningClient;
 
 mod config;
 mod nip47;
@@ -90,14 +86,14 @@ async fn main() -> anyhow::Result<()> {
 
                 // verify amount, convert to msats
                 if amount <= config.max_amount * 1_000 {
-                    let router_client = lnd_client.router().clone();
+                    let lnd = lnd_client.lightning().clone();
                     if let Err(e) = pay_invoice(
                         req.params.invoice,
                         keys.user_keys().public_key(),
                         event.id,
                         &keys.server_keys(),
                         &client,
-                        router_client,
+                        lnd,
                     )
                     .await
                     {
@@ -140,73 +136,60 @@ async fn pay_invoice(
     event_id: EventId,
     server_keys: &Keys,
     client: &Client,
-    mut router: LndRouterClient,
+    mut lnd: LndLightningClient,
 ) -> anyhow::Result<()> {
     println!("paying invoice: {ln_invoice}");
 
-    let req = tonic_openssl_lnd::routerrpc::SendPaymentRequest {
+    let req = tonic_openssl_lnd::lnrpc::SendRequest {
         payment_request: ln_invoice.to_string(),
-        timeout_seconds: 60,
-        no_inflight_updates: true,
-        time_pref: 0.9,
+        allow_self_payment: false,
         ..Default::default()
     };
 
-    let mut stream = router.send_payment_v2(req).await?.into_inner();
+    let response = lnd.send_payment_sync(req).await?.into_inner();
 
-    if let Some(payment) = stream.message().await.ok().flatten() {
-        let content =
-            if let Some(PaymentStatus::Succeeded) = PaymentStatus::from_i32(payment.status) {
-                println!("paid invoice: {}", ln_invoice.payment_hash().to_hex());
+    let payment_error = if response.payment_error.is_empty() {
+        None
+    } else {
+        Some(response.payment_error)
+    };
 
-                let preimage = payment.payment_preimage;
-                let json = json!({
-                    "result_type": "pay_invoice",
-                    "result": {
-                        "preimage": preimage
-                    }
-                });
+    let content = match payment_error {
+        None => {
+            println!("paid invoice: {}", ln_invoice.payment_hash().to_hex());
 
-                json.to_string()
-            } else {
-                let error_msg = match PaymentFailureReason::from_i32(payment.failure_reason) {
-                    Some(PaymentFailureReason::FailureReasonNone) => "No error?",
-                    Some(PaymentFailureReason::FailureReasonTimeout) => "Payment timeout.",
-                    Some(PaymentFailureReason::FailureReasonNoRoute) => "No route found.",
-                    Some(PaymentFailureReason::FailureReasonError) => {
-                        "A non-recoverable error has occurred."
-                    }
-                    Some(PaymentFailureReason::FailureReasonIncorrectPaymentDetails) => {
-                        "Incorrect payment details."
-                    }
-                    Some(PaymentFailureReason::FailureReasonInsufficientBalance) => {
-                        "Insufficient balance."
-                    }
-                    None => "Unknown error.",
-                };
-                let json = json!({
-                    "result_type": "pay_invoice",
-                    "error": {
-                        "code": "INSUFFICIENT_BALANCE",
-                        "message": error_msg
-                    }
-                });
+            let preimage = response.payment_preimage.to_hex();
+            let json = json!({
+                "result_type": "pay_invoice",
+                "result": {
+                    "preimage": preimage
+                }
+            });
 
-                json.to_string()
-            };
+            json.to_string()
+        }
+        Some(error_msg) => {
+            let json = json!({
+                "result_type": "pay_invoice",
+                "error": {
+                    "code": "INSUFFICIENT_BALANCE",
+                    "message": error_msg
+                }
+            });
 
-        let encrypted = encrypt(&server_keys.secret_key().unwrap(), &user_key, &content).unwrap();
-        let p_tag = Tag::PubKey(user_key, None);
-        let e_tag = Tag::Event(event_id, None, None);
-        let response = EventBuilder::new(Kind::Custom(23195), encrypted, &[p_tag, e_tag])
-            .to_event(server_keys)?;
+            json.to_string()
+        }
+    };
 
-        client.send_event(response).await?;
-        return Ok(());
-    }
+    let encrypted = encrypt(&server_keys.secret_key().unwrap(), &user_key, &content).unwrap();
+    let p_tag = Tag::PubKey(user_key, None);
+    let e_tag = Tag::Event(event_id, None, None);
+    let response =
+        EventBuilder::new(Kind::Custom(23195), encrypted, &[p_tag, e_tag]).to_event(server_keys)?;
 
-    eprintln!("failed to pay invoice: {ln_invoice}");
-    Err(anyhow!("Failed to handle invoice"))
+    client.send_event(response).await?;
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
