@@ -122,6 +122,7 @@ async fn pay_invoice(
 
 	let req = tonic_openssl_lnd::routerrpc::SendPaymentRequest {
 		payment_request: ln_invoice.to_string(),
+		timeout_seconds: 60,
 		no_inflight_updates: true,
 		time_pref: 0.9,
 		..Default::default()
