@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
 	println!("Listening for nip 47 requests...");
 	println!();
 	let encoded_relay = urlencoding::encode(&config.relay);
-	println!("nostr+walletconnect:{}?relay={}&secret={}", keys.server_keys().public_key().to_hex(), &encoded_relay, keys.user_key.secret_bytes().to_hex());
+	println!("nostr+walletconnect://{}?relay={}&secret={}", keys.server_keys().public_key().to_hex(), &encoded_relay, keys.user_key.secret_bytes().to_hex());
 
 
 	let mut notifications = client.notifications();
