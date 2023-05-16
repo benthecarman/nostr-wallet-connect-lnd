@@ -80,7 +80,6 @@ async fn main() -> anyhow::Result<()> {
 
 				// verify amount, convert to msats
 				if amount <= config.max_amount * 1_000 {
-					print!("Paying invoice: {}...", req.params.invoice);
 					let router_client = lnd_client.router().clone();
 					if let Err(e) = pay_invoice(req.params.invoice, keys.user_keys().public_key(), event.id, &keys.server_keys(), &client, router_client).await {
 						eprintln!("failed to pay invoice: {e}");
