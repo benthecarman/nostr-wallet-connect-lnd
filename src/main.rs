@@ -173,6 +173,7 @@ async fn pay_invoice(
 		return Ok(());
 	}
 
+	eprintln!("failed to pay invoice: {ln_invoice}");
 	Err(anyhow!("Failed to handle invoice"))
 }
 
