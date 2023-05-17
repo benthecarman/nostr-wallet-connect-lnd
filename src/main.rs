@@ -46,109 +46,121 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Connected to lnd: {}", lnd_info.identity_pubkey);
 
-    let client = Client::new(&keys.server_keys());
-    client.add_relay(&config.relay, None).await?;
+    let mut broadcasted_info = false;
 
-    client.connect().await;
-
-    // broadcast info event
-    let info = EventBuilder::new(Kind::Custom(13194), "pay_invoice".to_string(), &[])
-        .to_event(&keys.server_keys())?;
-
-    client.send_event(info).await?;
-    let nip47_request_kind = Kind::Custom(23194);
-    let subscription = Filter::new()
-        .kinds(vec![nip47_request_kind])
-        .author(keys.user_keys().public_key())
-        .pubkey(keys.server_keys().public_key())
-        .since(Timestamp::now());
-
-    client.subscribe(vec![subscription]).await;
-
-    println!("Listening for nip 47 requests...");
-    println!();
     let encoded_relay = urlencoding::encode(&config.relay);
     println!(
-        "nostr+walletconnect://{}?relay={}&secret={}",
+        "\nnostr+walletconnect://{}?relay={}&secret={}\n",
         keys.server_keys().public_key().to_hex(),
         &encoded_relay,
         keys.user_key.secret_bytes().to_hex()
     );
 
-    let mut notifications = client.notifications();
-    while let Ok(notification) = notifications.recv().await {
-        if let Event(_url, event) = notification {
-            if event.kind == nip47_request_kind && event.pubkey == keys.user_keys().public_key() {
-                let decrypted = decrypt(
-                    &keys.server_key,
-                    &keys.user_keys().public_key(),
-                    &event.content,
-                )
-                .unwrap();
-                let req: Nip47Request = serde_json::from_str(&decrypted).unwrap();
+    // loop in case we get disconnected
+    loop {
+        let client = Client::new(&keys.server_keys());
+        client.add_relay(&config.relay, None).await?;
 
-                // only pay invoice requests
-                if req.method != "pay_invoice" {
-                    continue;
-                }
+        client.connect().await;
 
-                let msats = req.params.invoice.amount_milli_satoshis().unwrap_or(0);
+        // broadcast info event
+        if !broadcasted_info {
+            let info = EventBuilder::new(Kind::Custom(13194), "pay_invoice".to_string(), &[])
+                .to_event(&keys.server_keys())?;
+            client.send_event(info).await?;
 
-                let error_msg = if msats > config.max_amount * 1_000 {
-                    Some("Invoice amount too high.")
-                } else if tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000 {
-                    Some("Daily limit exceeded.")
-                } else {
-                    None
-                };
+            broadcasted_info = true;
+        }
 
-                // verify amount, convert to msats
-                let content = match error_msg {
-                    None => {
-                        let lnd = lnd_client.lightning().clone();
-                        match pay_invoice(req.params.invoice, lnd).await {
-                            Ok(content) => {
-                                // add payment to tracker
-                                tracker.lock().await.add_payment(msats);
-                                content
-                            }
-                            Err(e) => {
-                                eprintln!("Error paying invoice: {e}");
+        let nip47_request_kind = Kind::Custom(23194);
+        let subscription = Filter::new()
+            .kinds(vec![nip47_request_kind])
+            .author(keys.user_keys().public_key())
+            .pubkey(keys.server_keys().public_key())
+            .since(Timestamp::now());
 
-                                json!({
-                                    "result_type": "pay_invoice",
-                                    "result": {
-                                        "code": "INSUFFICIENT_BALANCE",
-                                        "error": format!("Failed to pay invoice: {e}")
-                                    }
-                                })
-                                .to_string()
-                            }
-                        }
+        client.subscribe(vec![subscription]).await;
+
+        println!("Listening for nip 47 requests...");
+
+        let mut notifications = client.notifications();
+        while let Ok(notification) = notifications.recv().await {
+            if let Event(_url, event) = notification {
+                if event.kind == nip47_request_kind && event.pubkey == keys.user_keys().public_key()
+                {
+                    let decrypted = decrypt(
+                        &keys.server_key,
+                        &keys.user_keys().public_key(),
+                        &event.content,
+                    )
+                    .unwrap();
+                    let req: Nip47Request = serde_json::from_str(&decrypted).unwrap();
+
+                    // only pay invoice requests
+                    if req.method != "pay_invoice" {
+                        continue;
                     }
-                    Some(err_msg) => json!({
-                        "result_type": "pay_invoice",
-                        "result": {
-                            "code": "QUOTA_EXCEEDED",
-                            "error": err_msg
+
+                    let msats = req.params.invoice.amount_milli_satoshis().unwrap_or(0);
+
+                    let error_msg = if msats > config.max_amount * 1_000 {
+                        Some("Invoice amount too high.")
+                    } else if tracker.lock().await.sum_payments() + msats
+                        > config.daily_limit * 1_000
+                    {
+                        Some("Daily limit exceeded.")
+                    } else {
+                        None
+                    };
+
+                    // verify amount, convert to msats
+                    let content = match error_msg {
+                        None => {
+                            let lnd = lnd_client.lightning().clone();
+                            match pay_invoice(req.params.invoice, lnd).await {
+                                Ok(content) => {
+                                    // add payment to tracker
+                                    tracker.lock().await.add_payment(msats);
+                                    content
+                                }
+                                Err(e) => {
+                                    eprintln!("Error paying invoice: {e}");
+
+                                    json!({
+                                        "result_type": "pay_invoice",
+                                        "result": {
+                                            "code": "INSUFFICIENT_BALANCE",
+                                            "error": format!("Failed to pay invoice: {e}")
+                                        }
+                                    })
+                                    .to_string()
+                                }
+                            }
                         }
-                    })
-                    .to_string(),
-                };
+                        Some(err_msg) => json!({
+                            "result_type": "pay_invoice",
+                            "result": {
+                                "code": "QUOTA_EXCEEDED",
+                                "error": err_msg
+                            }
+                        })
+                        .to_string(),
+                    };
 
-                let encrypted =
-                    encrypt(&keys.server_key, &keys.user_keys().public_key(), &content).unwrap();
-                let p_tag = Tag::PubKey(event.pubkey, None);
-                let e_tag = Tag::Event(event.id, None, None);
-                let response = EventBuilder::new(Kind::Custom(23195), encrypted, &[p_tag, e_tag])
-                    .to_event(&keys.server_keys())?;
+                    let encrypted =
+                        encrypt(&keys.server_key, &keys.user_keys().public_key(), &content)
+                            .unwrap();
+                    let p_tag = Tag::PubKey(event.pubkey, None);
+                    let e_tag = Tag::Event(event.id, None, None);
+                    let response =
+                        EventBuilder::new(Kind::Custom(23195), encrypted, &[p_tag, e_tag])
+                            .to_event(&keys.server_keys())?;
 
-                client.send_event(response).await?;
+                    client.send_event(response).await?;
+                }
             }
         }
     }
-
-    Ok(())
 }
 
 async fn pay_invoice(ln_invoice: Invoice, mut lnd: LndLightningClient) -> anyhow::Result<String> {
