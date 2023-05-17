@@ -87,47 +87,47 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                let amount = req.params.invoice.amount_milli_satoshis().unwrap_or(0);
+                let msats = req.params.invoice.amount_milli_satoshis().unwrap_or(0);
 
                 // verify amount, convert to msats
-                if amount <= config.max_amount * 1_000 {
+                let content = if msats <= config.max_amount * 1_000 {
                     let lnd = lnd_client.lightning().clone();
-                    if let Err(e) = pay_invoice(
-                        req.params.invoice,
-                        keys.user_keys().public_key(),
-                        event.id,
-                        &keys.server_keys(),
-                        &client,
-                        lnd,
-                    )
-                    .await
-                    {
-                        eprintln!("failed to pay invoice: {e}");
+                    match pay_invoice(req.params.invoice, lnd).await {
+                        Ok(content) => content,
+                        Err(e) => {
+                            eprintln!("Error paying invoice: {e}");
+
+                            let content = json!({
+                                "result_type": "pay_invoice",
+                                "result": {
+                                    "code": "INSUFFICIENT_BALANCE",
+                                    "error": format!("Failed to pay invoice: {e}")
+                                }
+                            });
+                            content.to_string()
+                        }
                     }
                 } else {
-                    println!("Invoice amount too high: {}", amount);
+                    eprintln!("Invoice amount too high: {msats} msats");
 
-                    let content = json!({
+                    json!({
                         "result_type": "pay_invoice",
                         "result": {
                             "code": "QUOTA_EXCEEDED",
                             "error": "Invoice amount too high."
                         }
-                    });
-                    let encrypted = encrypt(
-                        &keys.server_key,
-                        &keys.user_keys().public_key(),
-                        &content.to_string(),
-                    )
-                    .unwrap();
-                    let p_tag = Tag::PubKey(event.pubkey, None);
-                    let e_tag = Tag::Event(event.id, None, None);
-                    let response =
-                        EventBuilder::new(Kind::Custom(23195), encrypted, &[p_tag, e_tag])
-                            .to_event(&keys.server_keys())?;
+                    })
+                    .to_string()
+                };
 
-                    client.send_event(response).await?;
-                }
+                let encrypted =
+                    encrypt(&keys.server_key, &keys.user_keys().public_key(), &content).unwrap();
+                let p_tag = Tag::PubKey(event.pubkey, None);
+                let e_tag = Tag::Event(event.id, None, None);
+                let response = EventBuilder::new(Kind::Custom(23195), encrypted, &[p_tag, e_tag])
+                    .to_event(&keys.server_keys())?;
+
+                client.send_event(response).await?;
             }
         }
     }
@@ -135,14 +135,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn pay_invoice(
-    ln_invoice: Invoice,
-    user_key: XOnlyPublicKey,
-    event_id: EventId,
-    server_keys: &Keys,
-    client: &Client,
-    mut lnd: LndLightningClient,
-) -> anyhow::Result<()> {
+async fn pay_invoice(ln_invoice: Invoice, mut lnd: LndLightningClient) -> anyhow::Result<String> {
     println!("paying invoice: {ln_invoice}");
 
     let req = tonic_openssl_lnd::lnrpc::SendRequest {
@@ -186,15 +179,7 @@ async fn pay_invoice(
         }
     };
 
-    let encrypted = encrypt(&server_keys.secret_key().unwrap(), &user_key, &content).unwrap();
-    let p_tag = Tag::PubKey(user_key, None);
-    let e_tag = Tag::Event(event_id, None, None);
-    let response =
-        EventBuilder::new(Kind::Custom(23195), encrypted, &[p_tag, e_tag]).to_event(server_keys)?;
-
-    client.send_event(response).await?;
-
-    Ok(())
+    Ok(content)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
