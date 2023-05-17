@@ -14,6 +14,9 @@ pub struct Config {
     /// Max invoice payment amount, in satoshis
     #[clap(default_value_t = 100_000, long)]
     pub max_amount: u64,
+    /// Max payment amount per day, in satoshis
+    #[clap(default_value_t = 100_000, long)]
+    pub daily_limit: u64,
     #[clap(default_value_t = String::from("127.0.0.1"), long)]
     /// Host of the GRPC server for lnd
     pub lnd_host: String,

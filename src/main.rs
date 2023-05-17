@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::nip47::Nip47Request;
+use crate::payments::PaymentTracker;
 use bitcoin::hashes::hex::ToHex;
 use clap::Parser;
 use lightning_invoice::Invoice;
@@ -12,16 +13,20 @@ use serde_json::json;
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Write};
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse};
 use tonic_openssl_lnd::LndLightningClient;
 
 mod config;
 mod nip47;
+mod payments;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config: Config = Config::parse();
     let keys = get_keys(&config.keys_file);
+    let tracker = Arc::new(Mutex::new(PaymentTracker::new()));
 
     let mut lnd_client = tonic_openssl_lnd::connect(
         config.lnd_host.clone(),
@@ -89,35 +94,46 @@ async fn main() -> anyhow::Result<()> {
 
                 let msats = req.params.invoice.amount_milli_satoshis().unwrap_or(0);
 
-                // verify amount, convert to msats
-                let content = if msats <= config.max_amount * 1_000 {
-                    let lnd = lnd_client.lightning().clone();
-                    match pay_invoice(req.params.invoice, lnd).await {
-                        Ok(content) => content,
-                        Err(e) => {
-                            eprintln!("Error paying invoice: {e}");
+                let error_msg = if msats > config.max_amount * 1_000 {
+                    Some("Invoice amount too high.")
+                } else if tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000 {
+                    Some("Daily limit exceeded.")
+                } else {
+                    None
+                };
 
-                            let content = json!({
-                                "result_type": "pay_invoice",
-                                "result": {
-                                    "code": "INSUFFICIENT_BALANCE",
-                                    "error": format!("Failed to pay invoice: {e}")
-                                }
-                            });
-                            content.to_string()
+                // verify amount, convert to msats
+                let content = match error_msg {
+                    None => {
+                        let lnd = lnd_client.lightning().clone();
+                        match pay_invoice(req.params.invoice, lnd).await {
+                            Ok(content) => {
+                                // add payment to tracker
+                                tracker.lock().await.add_payment(msats);
+                                content
+                            }
+                            Err(e) => {
+                                eprintln!("Error paying invoice: {e}");
+
+                                json!({
+                                    "result_type": "pay_invoice",
+                                    "result": {
+                                        "code": "INSUFFICIENT_BALANCE",
+                                        "error": format!("Failed to pay invoice: {e}")
+                                    }
+                                })
+                                .to_string()
+                            }
                         }
                     }
-                } else {
-                    eprintln!("Invoice amount too high: {msats} msats");
-
-                    json!({
+                    Some(err_msg) => json!({
                         "result_type": "pay_invoice",
                         "result": {
                             "code": "QUOTA_EXCEEDED",
-                            "error": "Invoice amount too high."
+                            "error": err_msg
                         }
                     })
-                    .to_string()
+                    .to_string(),
                 };
 
                 let encrypted =
