@@ -82,6 +82,11 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap();
                 let req: Nip47Request = serde_json::from_str(&decrypted).unwrap();
 
+                // only pay invoice requests
+                if req.method != "pay_invoice" {
+                    continue;
+                }
+
                 let amount = req.params.invoice.amount_milli_satoshis().unwrap_or(0);
 
                 // verify amount, convert to msats
