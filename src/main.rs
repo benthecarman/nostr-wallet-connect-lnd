@@ -1,25 +1,26 @@
 use crate::config::Config;
-use crate::nip47::Nip47Request;
 use crate::payments::PaymentTracker;
+use anyhow::anyhow;
 use bitcoin::hashes::hex::ToHex;
 use clap::Parser;
 use lightning_invoice::Invoice;
+use nostr::nips::nip47::{
+    ErrorCode, Method, NIP47Error, NostrWalletConnectURI, Request, Response, ResponseResult,
+};
 use nostr::prelude::*;
 use nostr::Keys;
-use nostr_sdk::relay::pool::RelayPoolNotification::*;
-use nostr_sdk::Client;
+use nostr_sdk::{Client, RelayPoolNotification};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Write};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse};
 use tonic_openssl_lnd::LndLightningClient;
 
 mod config;
-mod nip47;
 mod payments;
 
 #[tokio::main]
@@ -48,13 +49,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut broadcasted_info = false;
 
-    let encoded_relay = urlencoding::encode(&config.relay);
-    println!(
-        "\nnostr+walletconnect://{}?relay={}&secret={}\n",
-        keys.server_keys().public_key().to_hex(),
-        &encoded_relay,
-        keys.user_key.secret_bytes().to_hex()
-    );
+    let uri = NostrWalletConnectURI::new(
+        keys.server_keys().public_key(),
+        config.relay.parse()?,
+        Some(keys.user_key),
+        None,
+    )?;
+    println!("\n{uri}\n");
 
     // loop in case we get disconnected
     loop {
@@ -65,17 +66,16 @@ async fn main() -> anyhow::Result<()> {
 
         // broadcast info event
         if !broadcasted_info {
-            let info = EventBuilder::new(Kind::Custom(13194), "pay_invoice".to_string(), &[])
+            let info = EventBuilder::new(Kind::WalletConnectInfo, "pay_invoice".to_string(), &[])
                 .to_event(&keys.server_keys())?;
             client.send_event(info).await?;
 
             broadcasted_info = true;
         }
 
-        let nip47_request_kind = Kind::Custom(23194);
         let subscription = Filter::new()
-            .kinds(vec![nip47_request_kind])
-            .author(keys.user_keys().public_key())
+            .kinds(vec![Kind::WalletConnectRequest])
+            .author(keys.user_keys().public_key().to_hex())
             .pubkey(keys.server_keys().public_key())
             .since(Timestamp::now());
 
@@ -85,85 +85,109 @@ async fn main() -> anyhow::Result<()> {
 
         let mut notifications = client.notifications();
         while let Ok(notification) = notifications.recv().await {
-            if let Event(_url, event) = notification {
-                if event.kind == nip47_request_kind && event.pubkey == keys.user_keys().public_key()
+            if let RelayPoolNotification::Event(_url, event) = notification {
+                if event.kind == Kind::WalletConnectRequest
+                    && event.pubkey == keys.user_keys().public_key()
                 {
-                    let decrypted = decrypt(
-                        &keys.server_key,
-                        &keys.user_keys().public_key(),
-                        &event.content,
+                    if let Err(e) = handle_nwc_request(
+                        event,
+                        &keys,
+                        &config,
+                        &client,
+                        tracker.clone(),
+                        lnd_client.lightning().clone(),
                     )
-                    .unwrap();
-                    let req: Nip47Request = serde_json::from_str(&decrypted).unwrap();
-
-                    // only pay invoice requests
-                    if req.method != "pay_invoice" {
-                        continue;
-                    }
-
-                    let msats = req.params.invoice.amount_milli_satoshis().unwrap_or(0);
-
-                    let error_msg = if msats > config.max_amount * 1_000 {
-                        Some("Invoice amount too high.")
-                    } else if tracker.lock().await.sum_payments() + msats
-                        > config.daily_limit * 1_000
+                    .await
                     {
-                        Some("Daily limit exceeded.")
-                    } else {
-                        None
-                    };
-
-                    // verify amount, convert to msats
-                    let content = match error_msg {
-                        None => {
-                            let lnd = lnd_client.lightning().clone();
-                            match pay_invoice(req.params.invoice, lnd).await {
-                                Ok(content) => {
-                                    // add payment to tracker
-                                    tracker.lock().await.add_payment(msats);
-                                    content
-                                }
-                                Err(e) => {
-                                    eprintln!("Error paying invoice: {e}");
-
-                                    json!({
-                                        "result_type": "pay_invoice",
-                                        "result": {
-                                            "code": "INSUFFICIENT_BALANCE",
-                                            "error": format!("Failed to pay invoice: {e}")
-                                        }
-                                    })
-                                    .to_string()
-                                }
-                            }
-                        }
-                        Some(err_msg) => json!({
-                            "result_type": "pay_invoice",
-                            "result": {
-                                "code": "QUOTA_EXCEEDED",
-                                "error": err_msg
-                            }
-                        })
-                        .to_string(),
-                    };
-
-                    let encrypted =
-                        encrypt(&keys.server_key, &keys.user_keys().public_key(), &content)
-                            .unwrap();
-                    let p_tag = Tag::PubKey(event.pubkey, None);
-                    let e_tag = Tag::Event(event.id, None, None);
-                    let response =
-                        EventBuilder::new(Kind::Custom(23195), encrypted, &[p_tag, e_tag])
-                            .to_event(&keys.server_keys())?;
-
-                    client.send_event(response).await?;
+                        eprintln!("Error: {e}");
+                    }
                 }
             }
         }
     }
 }
 
-async fn pay_invoice(ln_invoice: Invoice, mut lnd: LndLightningClient) -> anyhow::Result<String> {
+async fn handle_nwc_request(
+    event: Event,
+    keys: &Nip47Keys,
+    config: &Config,
+    client: &Client,
+    tracker: Arc<Mutex<PaymentTracker>>,
+    lnd: LndLightningClient,
+) -> anyhow::Result<()> {
+    let decrypted = decrypt(
+        &keys.server_key,
+        &keys.user_keys().public_key(),
+        &event.content,
+    )?;
+    let req: Request = Request::from_json(&decrypted)?;
+
+    // only pay invoice requests
+    if req.method != Method::PayInvoice {
+        return Ok(());
+    }
+
+    let invoice =
+        Invoice::from_str(&req.params.invoice).map_err(|_| anyhow!("Failed to parse invoice"))?;
+    let msats = invoice.amount_milli_satoshis().unwrap_or(0);
+
+    let error_msg = if msats > config.max_amount * 1_000 {
+        Some("Invoice amount too high.")
+    } else if tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000 {
+        Some("Daily limit exceeded.")
+    } else {
+        None
+    };
+
+    // verify amount, convert to msats
+    let content = match error_msg {
+        None => {
+            match pay_invoice(invoice, lnd).await {
+                Ok(content) => {
+                    // add payment to tracker
+                    tracker.lock().await.add_payment(msats);
+                    content
+                }
+                Err(e) => {
+                    eprintln!("Error paying invoice: {e}");
+
+                    Response {
+                        result_type: Method::PayInvoice,
+                        error: Some(NIP47Error {
+                            code: ErrorCode::InsufficantBalance,
+                            message: format!("Failed to pay invoice: {e}"),
+                        }),
+                        result: None,
+                    }
+                }
+            }
+        }
+        Some(err_msg) => Response {
+            result_type: Method::PayInvoice,
+            error: Some(NIP47Error {
+                code: ErrorCode::QuotaExceeded,
+                message: err_msg.to_string(),
+            }),
+            result: None,
+        },
+    };
+
+    let encrypted = encrypt(
+        &keys.server_key,
+        &keys.user_keys().public_key(),
+        content.as_json(),
+    )?;
+    let p_tag = Tag::PubKey(event.pubkey, None);
+    let e_tag = Tag::Event(event.id, None, None);
+    let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted, &[p_tag, e_tag])
+        .to_event(&keys.server_keys())?;
+
+    client.send_event(response).await?;
+
+    Ok(())
+}
+
+async fn pay_invoice(ln_invoice: Invoice, mut lnd: LndLightningClient) -> anyhow::Result<Response> {
     println!("paying invoice: {ln_invoice}");
 
     let req = tonic_openssl_lnd::lnrpc::SendRequest {
@@ -180,34 +204,28 @@ async fn pay_invoice(ln_invoice: Invoice, mut lnd: LndLightningClient) -> anyhow
         Some(response.payment_error)
     };
 
-    let content = match payment_error {
+    let response = match payment_error {
         None => {
             println!("paid invoice: {}", ln_invoice.payment_hash().to_hex());
 
             let preimage = response.payment_preimage.to_hex();
-            let json = json!({
-                "result_type": "pay_invoice",
-                "result": {
-                    "preimage": preimage
-                }
-            });
-
-            json.to_string()
+            Response {
+                result_type: Method::PayInvoice,
+                error: None,
+                result: Some(ResponseResult { preimage }),
+            }
         }
-        Some(error_msg) => {
-            let json = json!({
-                "result_type": "pay_invoice",
-                "error": {
-                    "code": "INSUFFICIENT_BALANCE",
-                    "message": error_msg
-                }
-            });
-
-            json.to_string()
-        }
+        Some(error_msg) => Response {
+            result_type: Method::PayInvoice,
+            error: Some(NIP47Error {
+                code: ErrorCode::InsufficantBalance,
+                message: error_msg,
+            }),
+            result: None,
+        },
     };
 
-    Ok(content)
+    Ok(response)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -241,11 +259,11 @@ fn get_keys(keys_file: &str) -> Nip47Keys {
     match File::open(path) {
         Ok(file) => {
             let reader = BufReader::new(file);
-            serde_json::from_reader(reader).expect("Could not parse JSON")
+            from_reader(reader).expect("Could not parse JSON")
         }
         Err(_) => {
             let keys = Nip47Keys::generate();
-            let json_str = serde_json::to_string(&keys).expect("Could not serialize data");
+            let json_str = to_string(&keys).expect("Could not serialize data");
 
             if let Some(parent) = path.parent() {
                 create_dir_all(parent).expect("Could not create directory");
