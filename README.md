@@ -2,8 +2,6 @@
 
 This lets you use nostr wallet connect with your LND node.
 
-cargo build --release cargo install --path .
-
 ## Install
 
 ```bash
