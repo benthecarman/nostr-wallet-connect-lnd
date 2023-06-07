@@ -12,7 +12,7 @@ cargo install --path .
 ## Usage
 
 ```bash
-nostr-wallet-connect-lnd --relay wss://relay.damus.io --lnd-host localhost --lnd-port 10009 --lnd-macaroon-path ~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon --lnd-cert-path ~/.lnd/tls.cert
+nostr-wallet-connect-lnd --relay wss://relay.damus.io --lnd-host localhost --lnd-port 10009 --macaroon-file ~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon --cert-file ~/.lnd/tls.cert
 ```
 
 This will print a wallet connect uri to the console. Scan this with your wallet connect enabled wallet.
