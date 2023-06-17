@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
             if let RelayPoolNotification::Event(_url, event) = notification {
                 if event.kind == Kind::WalletConnectRequest
                     && event.pubkey == keys.user_keys().public_key()
+                    && event.verify().is_ok()
                 {
                     if let Err(e) = handle_nwc_request(
                         event,
