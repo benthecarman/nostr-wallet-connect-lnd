@@ -26,7 +26,7 @@ mod payments;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config: Config = Config::parse();
-    let keys = get_keys(&config.keys_file);
+    let mut keys = get_keys(&config.keys_file);
     let tracker = Arc::new(Mutex::new(PaymentTracker::new()));
 
     let mut lnd_client = tonic_openssl_lnd::connect(
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Connected to lnd: {}", lnd_info.identity_pubkey);
 
-    let mut broadcasted_info = false;
+    let mut broadcasted_info = keys.sent_info;
 
     let uri = NostrWalletConnectURI::new(
         keys.server_keys().public_key(),
@@ -71,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
             client.send_event(info).await?;
 
             broadcasted_info = true;
+            keys.sent_info = true;
+            write_keys(keys.clone(), Path::new(&config.keys_file));
         }
 
         let subscription = Filter::new()
@@ -235,6 +237,8 @@ async fn pay_invoice(ln_invoice: Invoice, mut lnd: LndLightningClient) -> anyhow
 struct Nip47Keys {
     server_key: SecretKey,
     user_key: SecretKey,
+    #[serde(default)]
+    sent_info: bool,
 }
 
 impl Nip47Keys {
@@ -245,6 +249,7 @@ impl Nip47Keys {
         Nip47Keys {
             server_key: server_key.secret_key().unwrap(),
             user_key: user_key.secret_key().unwrap(),
+            sent_info: false,
         }
     }
 
@@ -266,17 +271,21 @@ fn get_keys(keys_file: &str) -> Nip47Keys {
         }
         Err(_) => {
             let keys = Nip47Keys::generate();
-            let json_str = to_string(&keys).expect("Could not serialize data");
-
-            if let Some(parent) = path.parent() {
-                create_dir_all(parent).expect("Could not create directory");
-            }
-
-            let mut file = File::create(path).expect("Could not create file");
-            file.write_all(json_str.as_bytes())
-                .expect("Could not write to file");
-
-            keys
+            write_keys(keys, path)
         }
     }
+}
+
+fn write_keys(keys: Nip47Keys, path: &Path) -> Nip47Keys {
+    let json_str = to_string(&keys).expect("Could not serialize data");
+
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent).expect("Could not create directory");
+    }
+
+    let mut file = File::create(path).expect("Could not create file");
+    file.write_all(json_str.as_bytes())
+        .expect("Could not write to file");
+
+    keys
 }
