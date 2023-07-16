@@ -105,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        client.disconnect().await?;
     }
 }
 
