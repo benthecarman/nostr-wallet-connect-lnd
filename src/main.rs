@@ -90,18 +90,18 @@ async fn main() -> anyhow::Result<()> {
                     && event.pubkey == keys.user_keys().public_key()
                     && event.verify().is_ok()
                 {
-                    if let Err(e) = handle_nwc_request(
-                        event,
-                        &keys,
-                        &config,
-                        &client,
-                        tracker.clone(),
-                        lnd_client.lightning().clone(),
-                    )
-                    .await
-                    {
-                        eprintln!("Error: {e}");
-                    }
+                    let keys = keys.clone();
+                    let config = config.clone();
+                    let client = client.clone();
+                    let tracker = tracker.clone();
+                    let lnd = lnd_client.lightning().clone();
+                    tokio::task::spawn(async move {
+                        if let Err(e) =
+                            handle_nwc_request(event, &keys, &config, &client, tracker, lnd).await
+                        {
+                            eprintln!("Error: {e}");
+                        }
+                    });
                 }
             }
         }
