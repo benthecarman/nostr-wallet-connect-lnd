@@ -95,24 +95,32 @@ async fn main() -> anyhow::Result<()> {
 
         let mut notifications = client.notifications();
         while let Ok(notification) = notifications.recv().await {
-            if let RelayPoolNotification::Event(_url, event) = notification {
-                if event.kind == Kind::WalletConnectRequest
-                    && event.pubkey == keys.user_keys().public_key()
-                    && event.verify().is_ok()
-                {
-                    let keys = keys.clone();
-                    let config = config.clone();
-                    let client = client.clone();
-                    let tracker = tracker.clone();
-                    let lnd = lnd_client.lightning().clone();
-                    tokio::task::spawn(async move {
-                        if let Err(e) =
-                            handle_nwc_request(event, &keys, &config, &client, tracker, lnd).await
-                        {
-                            eprintln!("Error: {e}");
-                        }
-                    });
+            match notification {
+                RelayPoolNotification::Event(_url, event) => {
+                    if event.kind == Kind::WalletConnectRequest
+                        && event.pubkey == keys.user_keys().public_key()
+                        && event.verify().is_ok()
+                    {
+                        let keys = keys.clone();
+                        let config = config.clone();
+                        let client = client.clone();
+                        let tracker = tracker.clone();
+                        let lnd = lnd_client.lightning().clone();
+                        tokio::task::spawn(async move {
+                            if let Err(e) =
+                                handle_nwc_request(event, &keys, &config, &client, tracker, lnd)
+                                    .await
+                            {
+                                eprintln!("Error: {e}");
+                            }
+                        });
+                    }
                 }
+                RelayPoolNotification::Shutdown => {
+                    println!("Relay pool shutdown");
+                    break;
+                }
+                _ => {}
             }
         }
 
