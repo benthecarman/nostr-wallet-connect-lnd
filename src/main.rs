@@ -1,12 +1,14 @@
 use crate::config::Config;
+use crate::nwc::{
+    ErrorCode, LookupInvoiceResponseResult, MakeInvoiceResponseResult, Method, NIP47Error,
+    NostrWalletConnectURI, PayInvoiceResponseResult, Request, RequestParams, Response,
+    ResponseResult,
+};
 use crate::payments::PaymentTracker;
 use anyhow::anyhow;
-use bitcoin::hashes::hex::ToHex;
+use bitcoin::hashes::hex::{FromHex, ToHex};
 use clap::Parser;
-use lightning_invoice::Invoice;
-use nostr::nips::nip47::{
-    ErrorCode, Method, NIP47Error, NostrWalletConnectURI, Request, Response, ResponseResult,
-};
+use lightning_invoice::Bolt11Invoice;
 use nostr::prelude::*;
 use nostr::Keys;
 use nostr_sdk::{Client, RelayPoolNotification};
@@ -17,10 +19,12 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse};
+use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
+use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse, Invoice, PaymentHash};
 use tonic_openssl_lnd::LndLightningClient;
 
 mod config;
+mod nwc;
 mod payments;
 
 #[tokio::main]
@@ -118,7 +122,7 @@ async fn handle_nwc_request(
     config: &Config,
     client: &Client,
     tracker: Arc<Mutex<PaymentTracker>>,
-    lnd: LndLightningClient,
+    mut lnd: LndLightningClient,
 ) -> anyhow::Result<()> {
     let decrypted = decrypt(
         &keys.server_key,
@@ -127,54 +131,104 @@ async fn handle_nwc_request(
     )?;
     let req: Request = Request::from_json(&decrypted)?;
 
-    // only pay invoice requests
-    if req.method != Method::PayInvoice {
-        return Ok(());
-    }
+    let content = match req.params {
+        RequestParams::PayInvoice(params) => {
+            let invoice = Bolt11Invoice::from_str(&params.invoice)
+                .map_err(|_| anyhow!("Failed to parse invoice"))?;
+            let msats = invoice.amount_milli_satoshis().unwrap_or(0);
 
-    let invoice =
-        Invoice::from_str(&req.params.invoice).map_err(|_| anyhow!("Failed to parse invoice"))?;
-    let msats = invoice.amount_milli_satoshis().unwrap_or(0);
+            let error_msg = if msats > config.max_amount * 1_000 {
+                Some("Invoice amount too high.")
+            } else if tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000 {
+                Some("Daily limit exceeded.")
+            } else {
+                None
+            };
 
-    let error_msg = if msats > config.max_amount * 1_000 {
-        Some("Invoice amount too high.")
-    } else if tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000 {
-        Some("Daily limit exceeded.")
-    } else {
-        None
-    };
+            // verify amount, convert to msats
+            match error_msg {
+                None => {
+                    match pay_invoice(invoice, lnd).await {
+                        Ok(content) => {
+                            // add payment to tracker
+                            tracker.lock().await.add_payment(msats);
+                            content
+                        }
+                        Err(e) => {
+                            eprintln!("Error paying invoice: {e}");
 
-    // verify amount, convert to msats
-    let content = match error_msg {
-        None => {
-            match pay_invoice(invoice, lnd).await {
-                Ok(content) => {
-                    // add payment to tracker
-                    tracker.lock().await.add_payment(msats);
-                    content
-                }
-                Err(e) => {
-                    eprintln!("Error paying invoice: {e}");
-
-                    Response {
-                        result_type: Method::PayInvoice,
-                        error: Some(NIP47Error {
-                            code: ErrorCode::InsufficantBalance,
-                            message: format!("Failed to pay invoice: {e}"),
-                        }),
-                        result: None,
+                            Response {
+                                result_type: Method::PayInvoice,
+                                error: Some(NIP47Error {
+                                    code: ErrorCode::InsufficantBalance,
+                                    message: format!("Failed to pay invoice: {e}"),
+                                }),
+                                result: None,
+                            }
+                        }
                     }
                 }
+                Some(err_msg) => Response {
+                    result_type: Method::PayInvoice,
+                    error: Some(NIP47Error {
+                        code: ErrorCode::QuotaExceeded,
+                        message: err_msg.to_string(),
+                    }),
+                    result: None,
+                },
             }
         }
-        Some(err_msg) => Response {
-            result_type: Method::PayInvoice,
-            error: Some(NIP47Error {
-                code: ErrorCode::QuotaExceeded,
-                message: err_msg.to_string(),
-            }),
-            result: None,
-        },
+        RequestParams::MakeInvoice(params) => {
+            let description_hash: Vec<u8> = match params.description_hash {
+                None => vec![],
+                Some(str) => FromHex::from_hex(&str)?,
+            };
+            let inv = Invoice {
+                memo: params.description.unwrap_or_default(),
+                description_hash,
+                value_msat: params.amount,
+                expiry: params.expiry.unwrap_or(86_400),
+                ..Default::default()
+            };
+            let res = lnd.add_invoice(inv).await?.into_inner();
+            Response {
+                result_type: Method::MakeInvoice,
+                error: None,
+                result: Some(ResponseResult::MakeInvoice(MakeInvoiceResponseResult {
+                    invoice: res.payment_request,
+                    payment_hash: res.r_hash.to_hex(),
+                })),
+            }
+        }
+        RequestParams::LookupInvoice(params) => {
+            let payment_hash: Vec<u8> = match params.payment_hash {
+                None => match params.bolt11 {
+                    None => return Err(anyhow!("Missing payment_hash or bolt11")),
+                    Some(bolt11) => {
+                        let invoice = Bolt11Invoice::from_str(&bolt11)
+                            .map_err(|_| anyhow!("Failed to parse invoice"))?;
+                        invoice.payment_hash().to_vec()
+                    }
+                },
+                Some(str) => FromHex::from_hex(&str)?,
+            };
+
+            let res = lnd
+                .lookup_invoice(PaymentHash {
+                    r_hash: payment_hash,
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+            Response {
+                result_type: Method::LookupInvoice,
+                error: None,
+                result: Some(ResponseResult::LookupInvoice(LookupInvoiceResponseResult {
+                    invoice: res.payment_request,
+                    paid: InvoiceState::from_i32(res.state) == Some(InvoiceState::Settled),
+                })),
+            }
+        }
     };
 
     let encrypted = encrypt(
@@ -192,7 +246,10 @@ async fn handle_nwc_request(
     Ok(())
 }
 
-async fn pay_invoice(ln_invoice: Invoice, mut lnd: LndLightningClient) -> anyhow::Result<Response> {
+async fn pay_invoice(
+    ln_invoice: Bolt11Invoice,
+    mut lnd: LndLightningClient,
+) -> anyhow::Result<Response> {
     println!("paying invoice: {ln_invoice}");
 
     let req = tonic_openssl_lnd::lnrpc::SendRequest {
@@ -217,7 +274,9 @@ async fn pay_invoice(ln_invoice: Invoice, mut lnd: LndLightningClient) -> anyhow
             Response {
                 result_type: Method::PayInvoice,
                 error: None,
-                result: Some(ResponseResult { preimage }),
+                result: Some(ResponseResult::PayInvoice(PayInvoiceResponseResult {
+                    preimage,
+                })),
             }
         }
         Some(error_msg) => Response {
