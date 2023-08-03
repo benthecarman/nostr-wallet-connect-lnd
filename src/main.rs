@@ -70,8 +70,12 @@ async fn main() -> anyhow::Result<()> {
 
         // broadcast info event
         if !broadcasted_info {
-            let info = EventBuilder::new(Kind::WalletConnectInfo, "pay_invoice".to_string(), &[])
-                .to_event(&keys.server_keys())?;
+            let info = EventBuilder::new(
+                Kind::WalletConnectInfo,
+                "pay_invoice make_invoice lookup_invoice".to_string(),
+                &[],
+            )
+            .to_event(&keys.server_keys())?;
             client.send_event(info).await?;
 
             broadcasted_info = true;
