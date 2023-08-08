@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::nwc::{
-    ErrorCode, LookupInvoiceResponseResult, MakeInvoiceResponseResult, Method, NIP47Error,
-    NostrWalletConnectURI, PayInvoiceResponseResult, Request, RequestParams, Response,
-    ResponseResult,
+    BudgetType, ErrorCode, GetBalanceResponseResult, LookupInvoiceResponseResult,
+    MakeInvoiceResponseResult, Method, NIP47Error, NostrWalletConnectURI, PayInvoiceResponseResult,
+    Request, RequestParams, Response, ResponseResult,
 };
 use crate::payments::PaymentTracker;
 use anyhow::anyhow;
@@ -20,7 +20,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
-use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse, Invoice, PaymentHash};
+use tonic_openssl_lnd::lnrpc::{
+    ChannelBalanceRequest, GetInfoRequest, GetInfoResponse, Invoice, PaymentHash,
+};
 use tonic_openssl_lnd::LndLightningClient;
 
 mod config;
@@ -238,6 +240,24 @@ async fn handle_nwc_request(
                 result: Some(ResponseResult::LookupInvoice(LookupInvoiceResponseResult {
                     invoice: res.payment_request,
                     paid: InvoiceState::from_i32(res.state) == Some(InvoiceState::Settled),
+                })),
+            }
+        }
+        RequestParams::GetBalance => {
+            let res = lnd
+                .channel_balance(ChannelBalanceRequest::default())
+                .await?
+                .into_inner();
+            let tracker = tracker.lock().await.sum_payments();
+            let remaining_msats = (config.daily_limit * 1_000 - tracker) / 1_000;
+            let max = remaining_msats.max(config.max_amount);
+            Response {
+                result_type: Method::GetBalance,
+                error: None,
+                result: Some(ResponseResult::GetBalance(GetBalanceResponseResult {
+                    balance: res.local_balance.unwrap_or_default().sat,
+                    max_amount: Some(max),
+                    budget_renewal: Some(BudgetType::Daily),
                 })),
             }
         }

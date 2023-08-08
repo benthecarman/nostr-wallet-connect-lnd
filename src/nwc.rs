@@ -138,6 +138,9 @@ pub enum Method {
     /// Lookup Invoice
     #[serde(rename = "lookup_invoice")]
     LookupInvoice,
+    /// Get Balance
+    #[serde(rename = "get_balance")]
+    GetBalance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +148,7 @@ pub enum RequestParams {
     PayInvoice(PayInvoiceRequestParams),
     MakeInvoice(MakeInvoiceRequestParams),
     LookupInvoice(LookupInvoiceRequestParams),
+    GetBalance,
 }
 
 impl Serialize for RequestParams {
@@ -156,6 +160,7 @@ impl Serialize for RequestParams {
             RequestParams::PayInvoice(p) => p.serialize(serializer),
             RequestParams::MakeInvoice(p) => p.serialize(serializer),
             RequestParams::LookupInvoice(p) => p.serialize(serializer),
+            RequestParams::GetBalance => serializer.serialize_none(),
         }
     }
 }
@@ -229,6 +234,7 @@ impl Request {
                 let params: LookupInvoiceRequestParams = serde_json::from_value(template.params)?;
                 RequestParams::LookupInvoice(params)
             }
+            Method::GetBalance => RequestParams::GetBalance,
         };
 
         Ok(Self {
@@ -278,11 +284,34 @@ pub struct LookupInvoiceResponseResult {
     pub paid: bool,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetType {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+/// NIP47 Response Result
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GetBalanceResponseResult {
+    /// Balance amount in sats
+    pub balance: u64,
+    /// Max amount payable within current budget
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_amount: Option<u64>,
+    /// Budget renewal type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_renewal: Option<BudgetType>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseResult {
     PayInvoice(PayInvoiceResponseResult),
     MakeInvoice(MakeInvoiceResponseResult),
     LookupInvoice(LookupInvoiceResponseResult),
+    GetBalance(GetBalanceResponseResult),
 }
 
 impl Serialize for ResponseResult {
@@ -294,6 +323,7 @@ impl Serialize for ResponseResult {
             ResponseResult::PayInvoice(p) => p.serialize(serializer),
             ResponseResult::MakeInvoice(p) => p.serialize(serializer),
             ResponseResult::LookupInvoice(p) => p.serialize(serializer),
+            ResponseResult::GetBalance(p) => p.serialize(serializer),
         }
     }
 }
@@ -346,6 +376,10 @@ impl Response {
                 Method::LookupInvoice => {
                     let result: LookupInvoiceResponseResult = serde_json::from_value(result)?;
                     ResponseResult::LookupInvoice(result)
+                }
+                Method::GetBalance => {
+                    let result: GetBalanceResponseResult = serde_json::from_value(result)?;
+                    ResponseResult::GetBalance(result)
                 }
             };
 
