@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         if !broadcasted_info {
             let info = EventBuilder::new(
                 Kind::WalletConnectInfo,
-                "pay_invoice make_invoice lookup_invoice".to_string(),
+                "pay_invoice make_invoice lookup_invoice get_balance".to_string(),
                 &[],
             )
             .to_event(&keys.server_keys())?;
