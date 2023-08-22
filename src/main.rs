@@ -18,6 +18,7 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use tonic_openssl_lnd::lnrpc::{
@@ -109,9 +110,11 @@ async fn main() -> anyhow::Result<()> {
                         let tracker = tracker.clone();
                         let lnd = lnd_client.lightning().clone();
                         tokio::task::spawn(async move {
-                            if let Err(e) =
-                                handle_nwc_request(event, &keys, &config, &client, tracker, lnd)
-                                    .await
+                            if let Err(e) = tokio::time::timeout(
+                                Duration::from_secs(60),
+                                handle_nwc_request(event, &keys, &config, &client, tracker, lnd),
+                            )
+                            .await
                             {
                                 eprintln!("Error: {e}");
                             }
