@@ -11,8 +11,8 @@ clap = { version = "4.1.14", features = ["derive"] }
 home = "0.5.4"
 bitcoin = "0.29.2"
 lightning-invoice = { version = "0.24.0", features = ["serde"] }
-nostr = "=0.22.0-bitcoin-v0.29"
-nostr-sdk = "=0.22.0-bitcoin-v0.29"
+nostr = "=0.23.0-bitcoin-v0.29"
+nostr-sdk = "=0.23.0-bitcoin-v0.29"
 tonic_openssl_lnd = "0.2.0"
 tokio = { version = "1.26.0", features = ["full"] }
 tokio-stream = "0.1.11"

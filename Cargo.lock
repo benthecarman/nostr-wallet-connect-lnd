@@ -126,6 +126,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-utility"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3716c0d3970fe92d79a8f4cda2caf91113574505dff5b18e455e549d4b078e98"
+dependencies = [
+ "futures-util",
+ "gloo-timers",
+ "tokio",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "async_io_stream"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1036,9 +1048,9 @@ checksum = "e5ce46fe64a9d73be07dcbe690a38ce1b293be448fd8ce1e6c1b8062c9f72c6a"
 
 [[package]]
 name = "nostr"
-version = "0.22.0-bitcoin-v0.29"
+version = "0.23.0-bitcoin-v0.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e2ee369508fd15077ed2a72e4a2f5308ac3f80c44fbd6f5b45bbc30872d3c97"
+checksum = "7f283c8b4825c8b3462dbfbf5804187d2ac5ac9073b1d222abe41aa138721b05"
 dependencies = [
  "aes",
  "base64 0.21.2",
@@ -1049,34 +1061,33 @@ dependencies = [
  "cbc",
  "getrandom",
  "instant",
- "log",
  "reqwest",
  "secp256k1",
  "serde",
  "serde_json",
+ "tracing",
  "url",
 ]
 
 [[package]]
 name = "nostr-sdk"
-version = "0.22.0-bitcoin-v0.29"
+version = "0.23.0-bitcoin-v0.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "573ca852c92564821446934f39a1039d6bb9c88c7511b9b7db077a43692baf11"
+checksum = "c4d241d256a751d472c3645d6f807672a3c81dba0a9cb0f288bf04f4f387b26c"
 dependencies = [
- "gloo-timers",
- "log",
+ "async-utility",
  "nostr",
  "nostr-sdk-net",
  "thiserror",
  "tokio",
- "wasm-bindgen-futures",
+ "tracing",
 ]
 
 [[package]]
 name = "nostr-sdk-net"
-version = "0.22.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d9a530ec3e9998f207e1a2a06ddadded76e716b3082c5c7aad6555a6f4099a9"
+checksum = "0b61e657a7dc7c64b1aaa8b8225983d1783c2dc3dd1f3844ac316a7ef360d65c"
 dependencies = [
  "futures-util",
  "thiserror",

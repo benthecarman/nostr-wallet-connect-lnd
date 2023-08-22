@@ -1,14 +1,14 @@
 use crate::config::Config;
-use crate::nwc::{
-    BudgetType, ErrorCode, GetBalanceResponseResult, LookupInvoiceResponseResult,
-    MakeInvoiceResponseResult, Method, NIP47Error, NostrWalletConnectURI, PayInvoiceResponseResult,
-    Request, RequestParams, Response, ResponseResult,
-};
 use crate::payments::PaymentTracker;
 use anyhow::anyhow;
 use bitcoin::hashes::hex::{FromHex, ToHex};
 use clap::Parser;
 use lightning_invoice::Bolt11Invoice;
+use nostr::nips::nip47::{
+    BudgetType, ErrorCode, GetBalanceResponseResult, LookupInvoiceResponseResult,
+    MakeInvoiceResponseResult, Method, NIP47Error, NostrWalletConnectURI, PayInvoiceResponseResult,
+    Request, RequestParams, Response, ResponseResult,
+};
 use nostr::prelude::*;
 use nostr::Keys;
 use nostr_sdk::{Client, RelayPoolNotification};
@@ -27,7 +27,6 @@ use tonic_openssl_lnd::lnrpc::{
 use tonic_openssl_lnd::LndLightningClient;
 
 mod config;
-mod nwc;
 mod payments;
 
 #[tokio::main]
@@ -67,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     // loop in case we get disconnected
     loop {
         let client = Client::new(&keys.server_keys());
-        client.add_relay(&config.relay, None).await?;
+        client.add_relay(config.relay.as_str(), None).await?;
 
         client.connect().await;
 
@@ -177,7 +176,7 @@ async fn handle_nwc_request(
                             Response {
                                 result_type: Method::PayInvoice,
                                 error: Some(NIP47Error {
-                                    code: ErrorCode::InsufficantBalance,
+                                    code: ErrorCode::InsufficientBalance,
                                     message: format!("Failed to pay invoice: {e}"),
                                 }),
                                 result: None,
@@ -317,7 +316,7 @@ async fn pay_invoice(
         Some(error_msg) => Response {
             result_type: Method::PayInvoice,
             error: Some(NIP47Error {
-                code: ErrorCode::InsufficantBalance,
+                code: ErrorCode::InsufficientBalance,
                 message: error_msg,
             }),
             result: None,
