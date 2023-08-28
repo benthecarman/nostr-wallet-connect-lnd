@@ -19,6 +19,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::select;
 use tokio::sync::Mutex;
 use tonic_openssl_lnd::lnrpc::invoice::InvoiceState;
 use tonic_openssl_lnd::lnrpc::{
@@ -96,35 +97,42 @@ async fn main() -> anyhow::Result<()> {
         println!("Listening for nip 47 requests...");
 
         let mut notifications = client.notifications();
-        while let Ok(notification) = notifications.recv().await {
-            match notification {
-                RelayPoolNotification::Event(_url, event) => {
-                    if event.kind == Kind::WalletConnectRequest
-                        && event.pubkey == keys.user_keys().public_key()
-                        && event.verify().is_ok()
-                    {
-                        let keys = keys.clone();
-                        let config = config.clone();
-                        let client = client.clone();
-                        let tracker = tracker.clone();
-                        let lnd = lnd_client.lightning().clone();
-                        tokio::task::spawn(async move {
-                            if let Err(e) = tokio::time::timeout(
-                                Duration::from_secs(60),
-                                handle_nwc_request(event, &keys, &config, &client, tracker, lnd),
-                            )
-                            .await
+        loop {
+            select! {
+                Ok(notification) = notifications.recv() => {
+                    match notification {
+                        RelayPoolNotification::Event(_url, event) => {
+                            if event.kind == Kind::WalletConnectRequest
+                                && event.pubkey == keys.user_keys().public_key()
+                                && event.verify().is_ok()
                             {
-                                eprintln!("Error: {e}");
+                                let keys = keys.clone();
+                                let config = config.clone();
+                                let client = client.clone();
+                                let tracker = tracker.clone();
+                                let lnd = lnd_client.lightning().clone();
+                                tokio::task::spawn(async move {
+                                    if let Err(e) = tokio::time::timeout(
+                                        Duration::from_secs(60),
+                                        handle_nwc_request(event, &keys, &config, &client, tracker, lnd),
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("Error: {e}");
+                                    }
+                                });
                             }
-                        });
+                        }
+                        RelayPoolNotification::Shutdown => {
+                            println!("Relay pool shutdown");
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                RelayPoolNotification::Shutdown => {
-                    println!("Relay pool shutdown");
+                _ = tokio::time::sleep(Duration::from_secs(3600)) => {
                     break;
                 }
-                _ => {}
             }
         }
 
