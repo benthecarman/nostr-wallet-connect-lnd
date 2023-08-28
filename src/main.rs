@@ -54,8 +54,6 @@ async fn main() -> anyhow::Result<()> {
 
     println!("Connected to lnd: {}", lnd_info.identity_pubkey);
 
-    let mut broadcasted_info = keys.sent_info;
-
     let uri = NostrWalletConnectURI::new(
         keys.server_keys().public_key(),
         config.relay.parse()?,
@@ -72,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         client.connect().await;
 
         // broadcast info event
-        if !broadcasted_info {
+        if !keys.sent_info {
             let info = EventBuilder::new(
                 Kind::WalletConnectInfo,
                 "pay_invoice make_invoice lookup_invoice get_balance".to_string(),
@@ -81,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
             .to_event(&keys.server_keys())?;
             client.send_event(info).await?;
 
-            broadcasted_info = true;
             keys.sent_info = true;
             write_keys(keys.clone(), Path::new(&config.keys_file));
         }
