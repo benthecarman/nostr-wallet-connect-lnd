@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
                                 && event.pubkey == keys.user_keys().public_key()
                                 && event.verify().is_ok()
                             {
+                                println!("Received event!");
                                 let keys = keys.clone();
                                 let config = config.clone();
                                 let client = client.clone();
@@ -118,6 +119,8 @@ async fn main() -> anyhow::Result<()> {
                                         eprintln!("Error: {e}");
                                     }
                                 });
+                            } else {
+                                eprintln!("Invalid event: {}", event.as_json());
                             }
                         }
                         RelayPoolNotification::Shutdown => {
