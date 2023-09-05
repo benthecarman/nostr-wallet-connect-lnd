@@ -62,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
     )?;
     println!("\n{uri}\n");
 
+    println!("server pubkey: {}", keys.user_keys().public_key().to_hex());
+
     // loop in case we get disconnected
     loop {
         let client = Client::new(&keys.server_keys());
