@@ -35,4 +35,4 @@ ENV VSS_PORT=8080
 EXPOSE $VSS_PORT
 
 # Run the app
-CMD ./nostr-wallet-connect-lnd
+CMD ["./nostr-wallet-connect-lnd"]
