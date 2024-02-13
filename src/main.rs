@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::payments::PaymentTracker;
 use anyhow::anyhow;
-use bitcoin::hashes::hex::{FromHex, ToHex};
+use bitcoin::hashes::hex::FromHex;
 use clap::Parser;
 use lightning_invoice::Bolt11Invoice;
 use nostr::nips::nip47::{
@@ -57,12 +57,12 @@ async fn main() -> anyhow::Result<()> {
     let uri = NostrWalletConnectURI::new(
         keys.server_keys().public_key(),
         config.relay.parse()?,
-        Some(keys.user_key),
+        keys.user_key,
         None,
     )?;
     println!("\n{uri}\n");
 
-    println!("server pubkey: {}", keys.user_keys().public_key().to_hex());
+    println!("server pubkey: {}", keys.user_keys().public_key());
 
     // Set up a oneshot channel to handle shutdown signal
     let (tx, rx) = oneshot::channel();
@@ -125,7 +125,7 @@ async fn event_loop(
     // loop in case we get disconnected
     loop {
         let client = Client::new(&keys.server_keys());
-        client.add_relay(config.relay.as_str(), None).await?;
+        client.add_relay(config.relay.as_str()).await?;
 
         client.connect().await;
 
@@ -134,7 +134,7 @@ async fn event_loop(
             let info = EventBuilder::new(
                 Kind::WalletConnectInfo,
                 "pay_invoice make_invoice lookup_invoice get_balance".to_string(),
-                &[],
+                [],
             )
             .to_event(&keys.server_keys())?;
             client.send_event(info).await?;
@@ -145,7 +145,7 @@ async fn event_loop(
 
         let subscription = Filter::new()
             .kinds(vec![Kind::WalletConnectRequest])
-            .author(keys.user_keys().public_key().to_hex())
+            .author(keys.user_keys().public_key())
             .pubkey(keys.server_keys().public_key())
             .since(Timestamp::now());
 
@@ -158,7 +158,7 @@ async fn event_loop(
             select! {
                 Ok(notification) = notifications.recv() => {
                     match notification {
-                        RelayPoolNotification::Event(_url, event) => {
+                        RelayPoolNotification::Event { event, .. } => {
                             if event.kind == Kind::WalletConnectRequest
                                 && event.pubkey == keys.user_keys().public_key()
                                 && event.verify().is_ok()
@@ -219,7 +219,7 @@ async fn handle_nwc_request(
     tracker: Arc<Mutex<PaymentTracker>>,
     mut lnd: LndLightningClient,
 ) -> anyhow::Result<()> {
-    let decrypted = decrypt(
+    let decrypted = nip04::decrypt(
         &keys.server_key,
         &keys.user_keys().public_key(),
         &event.content,
@@ -291,7 +291,7 @@ async fn handle_nwc_request(
                 error: None,
                 result: Some(ResponseResult::MakeInvoice(MakeInvoiceResponseResult {
                     invoice: res.payment_request,
-                    payment_hash: res.r_hash.to_hex(),
+                    payment_hash: ::hex::encode(res.r_hash),
                 })),
             }
         }
@@ -302,7 +302,7 @@ async fn handle_nwc_request(
                     Some(bolt11) => {
                         let invoice = Bolt11Invoice::from_str(&bolt11)
                             .map_err(|_| anyhow!("Failed to parse invoice"))?;
-                        invoice.payment_hash().to_vec()
+                        invoice.payment_hash().into_32().to_vec()
                     }
                 },
                 Some(str) => FromHex::from_hex(&str)?,
@@ -342,16 +342,19 @@ async fn handle_nwc_request(
                 })),
             }
         }
+        _ => {
+            return Err(anyhow!("Command not supported"));
+        }
     };
 
-    let encrypted = encrypt(
+    let encrypted = nip04::encrypt(
         &keys.server_key,
         &keys.user_keys().public_key(),
         content.as_json(),
     )?;
-    let p_tag = Tag::PubKey(event.pubkey, None);
-    let e_tag = Tag::Event(event.id, None, None);
-    let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted, &[p_tag, e_tag])
+    let p_tag = Tag::public_key(event.pubkey);
+    let e_tag = Tag::event(event.id);
+    let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted, [p_tag, e_tag])
         .to_event(&keys.server_keys())?;
 
     client.send_event(response).await?;
@@ -381,9 +384,9 @@ async fn pay_invoice(
 
     let response = match payment_error {
         None => {
-            println!("paid invoice: {}", ln_invoice.payment_hash().to_hex());
+            println!("paid invoice: {}", ln_invoice.payment_hash());
 
-            let preimage = response.payment_preimage.to_hex();
+            let preimage = ::hex::encode(response.payment_preimage);
             Response {
                 result_type: Method::PayInvoice,
                 error: None,

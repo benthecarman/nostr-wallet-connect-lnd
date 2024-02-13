@@ -68,6 +68,7 @@ pub fn default_macaroon_file(network: &Network) -> String {
         Network::Testnet => "testnet",
         Network::Signet => "signet",
         Network::Regtest => "regtest",
+        _ => unimplemented!("Network not supported"),
     };
 
     format!(
