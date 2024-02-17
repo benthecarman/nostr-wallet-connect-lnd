@@ -17,7 +17,7 @@ use nostr_sdk::{Client, RelayPoolNotification};
 use secp256k1::rand::rngs::OsRng;
 use secp256k1::{SecretKey, ThirtyTwoByteHash};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, File};
 use std::io::{BufReader, Write};
 use std::path::Path;
@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = tx.send(());
     });
 
-    let active_requests = Arc::new(Mutex::new(vec![]));
+    let active_requests = Arc::new(Mutex::new(HashSet::new()));
     let active_requests_clone = active_requests.clone();
     spawn(async move {
         if let Err(e) = event_loop(config, keys, lnd_client, active_requests_clone).await {
@@ -133,7 +133,7 @@ async fn event_loop(
     config: Config,
     mut keys: Nip47Keys,
     mut lnd_client: LndClient,
-    active_requests: Arc<Mutex<Vec<EventId>>>,
+    active_requests: Arc<Mutex<HashSet<EventId>>>,
 ) -> anyhow::Result<()> {
     let tracker = Arc::new(Mutex::new(PaymentTracker::new()));
     // loop in case we get disconnected
@@ -189,7 +189,7 @@ async fn event_loop(
                                 spawn(async move {
                                     let event_id = event.id;
                                     let mut ar = active_requests.lock().await;
-                                    ar.push(event_id);
+                                    ar.insert(event_id);
                                     drop(ar);
 
                                     if let Err(e) = tokio::time::timeout(
@@ -203,7 +203,7 @@ async fn event_loop(
 
                                     // remove request from active requests
                                     let mut ar = active_requests.lock().await;
-                                    ar.retain(|id| *id != event_id);
+                                    ar.remove(&event_id);
                                 });
                             } else {
                                 error!("Invalid event: {}", event.as_json());
