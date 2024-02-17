@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::payments::PaymentTracker;
 use anyhow::anyhow;
+use async_lock::RwLock;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{sha256, Hash};
 use clap::Parser;
@@ -104,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = tx.send(());
     });
 
-    let active_requests = Arc::new(Mutex::new(HashSet::new()));
+    let active_requests = Arc::new(RwLock::new(HashSet::new()));
     let active_requests_clone = active_requests.clone();
     spawn(async move {
         if let Err(e) = event_loop(config, keys, lnd_client, active_requests_clone).await {
@@ -117,12 +118,12 @@ async fn main() -> anyhow::Result<()> {
     info!("Shutting down...");
     // wait for active requests to complete
     loop {
-        let active_requests = active_requests.clone();
-        let requests = active_requests.lock().await;
+        let requests = active_requests.read().await;
         if requests.is_empty() {
             break;
         }
         debug!("Waiting for {} requests to complete...", requests.len());
+        drop(requests);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
@@ -133,7 +134,7 @@ async fn event_loop(
     config: Config,
     mut keys: Nip47Keys,
     mut lnd_client: LndClient,
-    active_requests: Arc<Mutex<HashSet<EventId>>>,
+    active_requests: Arc<RwLock<HashSet<EventId>>>,
 ) -> anyhow::Result<()> {
     let tracker = Arc::new(Mutex::new(PaymentTracker::new()));
     // loop in case we get disconnected
@@ -188,7 +189,7 @@ async fn event_loop(
 
                                 spawn(async move {
                                     let event_id = event.id;
-                                    let mut ar = active_requests.lock().await;
+                                    let mut ar = active_requests.write().await;
                                     ar.insert(event_id);
                                     drop(ar);
 
@@ -202,7 +203,7 @@ async fn event_loop(
                                     }
 
                                     // remove request from active requests
-                                    let mut ar = active_requests.lock().await;
+                                    let mut ar = active_requests.write().await;
                                     ar.remove(&event_id);
                                 });
                             } else {
