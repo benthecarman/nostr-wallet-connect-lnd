@@ -241,6 +241,8 @@ async fn handle_nwc_request(
     )?;
     let req: Request = Request::from_json(&decrypted)?;
 
+    debug!("Request params: {:?}", req.params);
+
     // split up the multis into their parts
     match req.params {
         RequestParams::MultiPayInvoice(params) => {
