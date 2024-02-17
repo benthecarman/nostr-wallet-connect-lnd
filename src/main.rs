@@ -5,6 +5,7 @@ use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{sha256, Hash};
 use clap::Parser;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription};
+use log::{debug, error, info};
 use nostr::nips::nip47::{
     ErrorCode, GetBalanceResponseResult, LookupInvoiceResponseResult, MakeInvoiceResponseResult,
     Method, NIP47Error, NostrWalletConnectURI, PayInvoiceResponseResult, Request, RequestParams,
@@ -45,6 +46,7 @@ const METHODS: [Method; 8] = [
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    pretty_env_logger::try_init()?;
     let config: Config = Config::parse();
     let keys = get_keys(&config.keys_file);
 
@@ -64,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to get lnd info")
         .into_inner();
 
-    println!("Connected to lnd: {}", lnd_info.identity_pubkey);
+    info!("Connected to lnd: {}", lnd_info.identity_pubkey);
 
     let uri = NostrWalletConnectURI::new(
         keys.server_keys().public_key(),
@@ -72,9 +74,9 @@ async fn main() -> anyhow::Result<()> {
         keys.user_key.into(),
         None,
     );
-    println!("\n{uri}\n");
+    info!("\n{uri}\n");
 
-    println!("server pubkey: {}", keys.user_keys().public_key());
+    debug!("server pubkey: {}", keys.user_keys().public_key());
 
     // Set up a oneshot channel to handle shutdown signal
     let (tx, rx) = oneshot::channel();
@@ -82,20 +84,20 @@ async fn main() -> anyhow::Result<()> {
     // Spawn a task to listen for shutdown signals
     spawn(async move {
         let mut term_signal = signal(SignalKind::terminate())
-            .map_err(|e| eprintln!("failed to install TERM signal handler: {e}"))
+            .map_err(|e| error!("failed to install TERM signal handler: {e}"))
             .unwrap();
         let mut int_signal = signal(SignalKind::interrupt())
             .map_err(|e| {
-                eprintln!("failed to install INT signal handler: {e}");
+                error!("failed to install INT signal handler: {e}");
             })
             .unwrap();
 
         select! {
             _ = term_signal.recv() => {
-                println!("Received SIGTERM");
+                debug!("Received SIGTERM");
             },
             _ = int_signal.recv() => {
-                println!("Received SIGINT");
+                debug!("Received SIGINT");
             },
         }
 
@@ -106,13 +108,13 @@ async fn main() -> anyhow::Result<()> {
     let active_requests_clone = active_requests.clone();
     spawn(async move {
         if let Err(e) = event_loop(config, keys, lnd_client, active_requests_clone).await {
-            eprintln!("Error: {e}");
+            error!("Error: {e}");
         }
     });
 
     rx.await?;
 
-    println!("Shutting down...");
+    info!("Shutting down...");
     // wait for active requests to complete
     loop {
         let active_requests = active_requests.clone();
@@ -120,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
         if requests.is_empty() {
             break;
         }
-        println!("Waiting for {} requests to complete...", requests.len());
+        debug!("Waiting for {} requests to complete...", requests.len());
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
@@ -164,7 +166,7 @@ async fn event_loop(
 
         client.subscribe(vec![subscription]).await;
 
-        println!("Listening for nip 47 requests...");
+        info!("Listening for nip 47 requests...");
 
         let mut notifications = client.notifications();
         loop {
@@ -176,7 +178,7 @@ async fn event_loop(
                                 && event.pubkey == keys.user_keys().public_key()
                                 && event.verify().is_ok()
                             {
-                                println!("Received event!");
+                                debug!("Received event!");
                                 let active_requests = active_requests.clone();
                                 let keys = keys.clone();
                                 let config = config.clone();
@@ -184,7 +186,7 @@ async fn event_loop(
                                 let tracker = tracker.clone();
                                 let lnd = lnd_client.lightning().clone();
 
-                                tokio::task::spawn(async move {
+                                spawn(async move {
                                     let event_id = event.id;
                                     let mut ar = active_requests.lock().await;
                                     ar.push(event_id);
@@ -196,7 +198,7 @@ async fn event_loop(
                                     )
                                     .await
                                     {
-                                        eprintln!("Error: {e}");
+                                        error!("Error: {e}");
                                     }
 
                                     // remove request from active requests
@@ -204,11 +206,11 @@ async fn event_loop(
                                     ar.retain(|id| *id != event_id);
                                 });
                             } else {
-                                eprintln!("Invalid event: {}", event.as_json());
+                                error!("Invalid event: {}", event.as_json());
                             }
                         }
                         RelayPoolNotification::Shutdown => {
-                            println!("Relay pool shutdown");
+                            info!("Relay pool shutdown");
                             break;
                         }
                         _ => {}
@@ -318,7 +320,7 @@ async fn handle_nwc_params(
                             content
                         }
                         Err(e) => {
-                            eprintln!("Error paying invoice: {e}");
+                            error!("Error paying invoice: {e}");
 
                             Response {
                                 result_type: Method::PayInvoice,
@@ -365,13 +367,13 @@ async fn handle_nwc_params(
                             content
                         }
                         Err(e) => {
-                            eprintln!("Error paying invoice: {e}");
+                            error!("Error paying keysend: {e}");
 
                             Response {
-                                result_type: Method::PayInvoice,
+                                result_type: Method::PayKeysend,
                                 error: Some(NIP47Error {
-                                    code: ErrorCode::InsufficientBalance,
-                                    message: format!("Failed to pay invoice: {e}"),
+                                    code: ErrorCode::PaymentFailed,
+                                    message: format!("Failed to pay keysend: {e}"),
                                 }),
                                 result: None,
                             }
@@ -379,7 +381,7 @@ async fn handle_nwc_params(
                     }
                 }
                 Some(err_msg) => Response {
-                    result_type: Method::PayInvoice,
+                    result_type: Method::PayKeysend,
                     error: Some(NIP47Error {
                         code: ErrorCode::QuotaExceeded,
                         message: err_msg.to_string(),
@@ -401,6 +403,9 @@ async fn handle_nwc_params(
                 ..Default::default()
             };
             let res = lnd.add_invoice(inv).await?.into_inner();
+
+            info!("Created invoice: {}", res.payment_request);
+
             Response {
                 result_type: Method::MakeInvoice,
                 error: None,
@@ -432,6 +437,8 @@ async fn handle_nwc_params(
                 })
                 .await?
                 .into_inner();
+
+            info!("Looked up invoice: {}", res.payment_request);
 
             let (description, description_hash) = match invoice {
                 Some(inv) => match inv.description() {
@@ -474,17 +481,19 @@ async fn handle_nwc_params(
         }
         RequestParams::GetBalance => {
             let tracker = tracker.lock().await.sum_payments();
-            let remaining_msats = (config.daily_limit * 1_000 - tracker) / 1_000;
+            let remaining_msats = config.daily_limit * 1_000 - tracker;
+            info!("Current balance: {remaining_msats}msats");
             Response {
                 result_type: Method::GetBalance,
                 error: None,
                 result: Some(ResponseResult::GetBalance(GetBalanceResponseResult {
-                    balance: remaining_msats * 1_000,
+                    balance: remaining_msats,
                 })),
             }
         }
         RequestParams::GetInfo => {
             let lnd_info: GetInfoResponse = lnd.get_info(GetInfoRequest {}).await?.into_inner();
+            info!("Getting info");
             Response {
                 result_type: Method::GetBalance,
                 error: None,
@@ -527,7 +536,7 @@ async fn pay_invoice(
     ln_invoice: Bolt11Invoice,
     mut lnd: LndLightningClient,
 ) -> anyhow::Result<Response> {
-    println!("paying invoice: {ln_invoice}");
+    debug!("paying invoice: {ln_invoice}");
 
     let req = tonic_openssl_lnd::lnrpc::SendRequest {
         payment_request: ln_invoice.to_string(),
@@ -545,7 +554,7 @@ async fn pay_invoice(
 
     let response = match payment_error {
         None => {
-            println!("paid invoice: {}", ln_invoice.payment_hash());
+            info!("paid invoice: {}", ln_invoice.payment_hash());
 
             let preimage = ::hex::encode(response.payment_preimage);
             Response {
@@ -576,7 +585,7 @@ async fn pay_keysend(
     amount_msats: u64,
     mut lnd: LndLightningClient,
 ) -> anyhow::Result<Response> {
-    println!("paying keysend to {pubkey} for {amount_msats}msats");
+    debug!("paying keysend to {pubkey} for {amount_msats}msats");
 
     let mut dest_custom_records = tlv_records
         .into_iter()
@@ -617,7 +626,7 @@ async fn pay_keysend(
 
     let response = match payment_error {
         None => {
-            println!("paid keysend to {pubkey} for {amount_msats}msats");
+            info!("paid keysend to {pubkey} for {amount_msats}msats");
 
             let preimage = ::hex::encode(response.payment_preimage);
             Response {
