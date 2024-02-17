@@ -32,13 +32,15 @@ use tonic_openssl_lnd::{LndClient, LndLightningClient};
 mod config;
 mod payments;
 
-const METHODS: [Method; 6] = [
+const METHODS: [Method; 8] = [
     Method::GetInfo,
     Method::MakeInvoice,
     Method::GetBalance,
     Method::LookupInvoice,
     Method::PayInvoice,
+    Method::MultiPayInvoice,
     Method::PayKeysend,
+    Method::MultiPayKeysend,
 ];
 
 #[tokio::main]
@@ -190,7 +192,7 @@ async fn event_loop(
 
                                     if let Err(e) = tokio::time::timeout(
                                         Duration::from_secs(60),
-                                        handle_nwc_request(event, &keys, &config, &client, tracker, lnd),
+                                        handle_nwc_request(event, keys, config, &client, tracker, lnd),
                                     )
                                     .await
                                     {
@@ -224,11 +226,11 @@ async fn event_loop(
 
 async fn handle_nwc_request(
     event: Event,
-    keys: &Nip47Keys,
-    config: &Config,
+    keys: Nip47Keys,
+    config: Config,
     client: &Client,
     tracker: Arc<Mutex<PaymentTracker>>,
-    mut lnd: LndLightningClient,
+    lnd: LndLightningClient,
 ) -> anyhow::Result<()> {
     let decrypted = nip04::decrypt(
         &keys.server_key.into(),
@@ -237,8 +239,60 @@ async fn handle_nwc_request(
     )?;
     let req: Request = Request::from_json(&decrypted)?;
 
-    let content = match req.params {
+    // split up the multis into their parts
+    match req.params {
+        RequestParams::MultiPayInvoice(params) => {
+            for inv in params.invoices {
+                let params = RequestParams::PayInvoice(inv);
+                let lnd = lnd.clone();
+                let tracker = tracker.clone();
+                let keys = keys.clone();
+                let config = config.clone();
+                let client = client.clone();
+                let event = event.clone();
+                spawn(async move {
+                    handle_nwc_params(params, &event, &keys, &config, &client, tracker, lnd).await
+                })
+                .await??;
+            }
+
+            Ok(())
+        }
+        RequestParams::MultiPayKeysend(params) => {
+            for inv in params.keysends {
+                let params = RequestParams::PayKeysend(inv);
+                let lnd = lnd.clone();
+                let tracker = tracker.clone();
+                let keys = keys.clone();
+                let config = config.clone();
+                let client = client.clone();
+                let event = event.clone();
+                spawn(async move {
+                    handle_nwc_params(params, &event, &keys, &config, &client, tracker, lnd).await
+                })
+                .await??;
+            }
+
+            Ok(())
+        }
+        params => handle_nwc_params(params, &event, &keys, &config, client, tracker, lnd).await,
+    }
+}
+
+async fn handle_nwc_params(
+    params: RequestParams,
+    event: &Event,
+    keys: &Nip47Keys,
+    config: &Config,
+    client: &Client,
+    tracker: Arc<Mutex<PaymentTracker>>,
+    mut lnd: LndLightningClient,
+) -> anyhow::Result<()> {
+    let mut d_tag: Option<Tag> = None;
+    let content = match params {
         RequestParams::PayInvoice(params) => {
+            d_tag = params.id.map(Tag::Identifier);
+
             let invoice = Bolt11Invoice::from_str(&params.invoice)
                 .map_err(|_| anyhow!("Failed to parse invoice"))?;
             let msats = invoice
@@ -288,6 +342,8 @@ async fn handle_nwc_request(
             }
         }
         RequestParams::PayKeysend(params) => {
+            d_tag = params.id.map(Tag::Identifier);
+
             let msats = params.amount;
             let error_msg = if msats > config.max_amount * 1_000 {
                 Some("Invoice amount too high.")
@@ -455,7 +511,11 @@ async fn handle_nwc_request(
     )?;
     let p_tag = Tag::public_key(event.pubkey);
     let e_tag = Tag::event(event.id);
-    let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted, [p_tag, e_tag])
+    let tags = match d_tag {
+        None => vec![p_tag, e_tag],
+        Some(d_tag) => vec![p_tag, e_tag, d_tag],
+    };
+    let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted, tags)
         .to_event(&keys.server_keys())?;
 
     client.send_event(response).await?;
