@@ -193,13 +193,15 @@ async fn event_loop(
                                     ar.insert(event_id);
                                     drop(ar);
 
-                                    if let Err(e) = tokio::time::timeout(
+                                    match tokio::time::timeout(
                                         Duration::from_secs(60),
                                         handle_nwc_request(event, keys, config, &client, tracker, lnd),
                                     )
                                     .await
                                     {
-                                        error!("Error: {e}");
+                                        Ok(Ok(_)) => {},
+                                        Ok(Err(e)) => error!("Error processing request: {e}"),
+                                        Err(e) => error!("Timeout error: {e}"),
                                     }
 
                                     // remove request from active requests
