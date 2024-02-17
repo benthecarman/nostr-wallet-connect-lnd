@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::config::Config;
 use crate::payments::PaymentTracker;
 use anyhow::anyhow;
@@ -258,7 +260,10 @@ async fn handle_nwc_request(
                 let client = client.clone();
                 let event = event.clone();
                 spawn(async move {
-                    handle_nwc_params(params, &event, &keys, &config, &client, tracker, lnd).await
+                    handle_nwc_params(
+                        params, req.method, &event, &keys, &config, &client, tracker, lnd,
+                    )
+                    .await
                 })
                 .await??;
             }
@@ -275,19 +280,28 @@ async fn handle_nwc_request(
                 let client = client.clone();
                 let event = event.clone();
                 spawn(async move {
-                    handle_nwc_params(params, &event, &keys, &config, &client, tracker, lnd).await
+                    handle_nwc_params(
+                        params, req.method, &event, &keys, &config, &client, tracker, lnd,
+                    )
+                    .await
                 })
                 .await??;
             }
 
             Ok(())
         }
-        params => handle_nwc_params(params, &event, &keys, &config, client, tracker, lnd).await,
+        params => {
+            handle_nwc_params(
+                params, req.method, &event, &keys, &config, client, tracker, lnd,
+            )
+            .await
+        }
     }
 }
 
 async fn handle_nwc_params(
     params: RequestParams,
+    method: Method,
     event: &Event,
     keys: &Nip47Keys,
     config: &Config,
@@ -318,7 +332,7 @@ async fn handle_nwc_params(
             // verify amount, convert to msats
             match error_msg {
                 None => {
-                    match pay_invoice(invoice, lnd).await {
+                    match pay_invoice(invoice, lnd, method).await {
                         Ok(content) => {
                             // add payment to tracker
                             tracker.lock().await.add_payment(msats);
@@ -328,7 +342,7 @@ async fn handle_nwc_params(
                             error!("Error paying invoice: {e}");
 
                             Response {
-                                result_type: Method::PayInvoice,
+                                result_type: method,
                                 error: Some(NIP47Error {
                                     code: ErrorCode::InsufficientBalance,
                                     message: format!("Failed to pay invoice: {e}"),
@@ -339,7 +353,7 @@ async fn handle_nwc_params(
                     }
                 }
                 Some(err_msg) => Response {
-                    result_type: Method::PayInvoice,
+                    result_type: method,
                     error: Some(NIP47Error {
                         code: ErrorCode::QuotaExceeded,
                         message: err_msg.to_string(),
@@ -364,7 +378,15 @@ async fn handle_nwc_params(
             match error_msg {
                 None => {
                     let pubkey = secp256k1::PublicKey::from_str(&params.pubkey)?;
-                    match pay_keysend(pubkey, params.preimage, params.tlv_records, msats, lnd).await
+                    match pay_keysend(
+                        pubkey,
+                        params.preimage,
+                        params.tlv_records,
+                        msats,
+                        lnd,
+                        method,
+                    )
+                    .await
                     {
                         Ok(content) => {
                             // add payment to tracker
@@ -375,7 +397,7 @@ async fn handle_nwc_params(
                             error!("Error paying keysend: {e}");
 
                             Response {
-                                result_type: Method::PayKeysend,
+                                result_type: method,
                                 error: Some(NIP47Error {
                                     code: ErrorCode::PaymentFailed,
                                     message: format!("Failed to pay keysend: {e}"),
@@ -386,7 +408,7 @@ async fn handle_nwc_params(
                     }
                 }
                 Some(err_msg) => Response {
-                    result_type: Method::PayKeysend,
+                    result_type: method,
                     error: Some(NIP47Error {
                         code: ErrorCode::QuotaExceeded,
                         message: err_msg.to_string(),
@@ -540,6 +562,7 @@ async fn handle_nwc_params(
 async fn pay_invoice(
     ln_invoice: Bolt11Invoice,
     mut lnd: LndLightningClient,
+    method: Method,
 ) -> anyhow::Result<Response> {
     debug!("paying invoice: {ln_invoice}");
 
@@ -563,7 +586,7 @@ async fn pay_invoice(
 
             let preimage = ::hex::encode(response.payment_preimage);
             Response {
-                result_type: Method::PayInvoice,
+                result_type: method,
                 error: None,
                 result: Some(ResponseResult::PayInvoice(PayInvoiceResponseResult {
                     preimage,
@@ -571,7 +594,7 @@ async fn pay_invoice(
             }
         }
         Some(error_msg) => Response {
-            result_type: Method::PayInvoice,
+            result_type: method,
             error: Some(NIP47Error {
                 code: ErrorCode::PaymentFailed,
                 message: error_msg,
@@ -589,6 +612,7 @@ async fn pay_keysend(
     tlv_records: Vec<KeysendTLVRecord>,
     amount_msats: u64,
     mut lnd: LndLightningClient,
+    method: Method,
 ) -> anyhow::Result<Response> {
     debug!("paying keysend to {pubkey} for {amount_msats}msats");
 
@@ -635,7 +659,7 @@ async fn pay_keysend(
 
             let preimage = ::hex::encode(response.payment_preimage);
             Response {
-                result_type: Method::PayKeysend,
+                result_type: method,
                 error: None,
                 result: Some(ResponseResult::PayKeysend(PayKeysendResponseResult {
                     preimage,
@@ -643,7 +667,7 @@ async fn pay_keysend(
             }
         }
         Some(error_msg) => Response {
-            result_type: Method::PayKeysend,
+            result_type: method,
             error: Some(NIP47Error {
                 code: ErrorCode::PaymentFailed,
                 message: error_msg,
