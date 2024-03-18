@@ -6,19 +6,14 @@ use anyhow::anyhow;
 use async_lock::RwLock;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{sha256, Hash};
+use bitcoin::secp256k1::rand::rngs::OsRng;
+use bitcoin::secp256k1::{SecretKey, ThirtyTwoByteHash};
 use clap::Parser;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription};
 use log::{debug, error, info};
-use nostr::nips::nip47::{
-    ErrorCode, GetBalanceResponseResult, LookupInvoiceResponseResult, MakeInvoiceResponseResult,
-    Method, NIP47Error, NostrWalletConnectURI, PayInvoiceResponseResult, Request, RequestParams,
-    Response, ResponseResult,
-};
+use nostr::nips::nip47::{Request, Response};
 use nostr::prelude::*;
-use nostr::Keys;
 use nostr_sdk::{Client, RelayPoolNotification};
-use secp256k1::rand::rngs::OsRng;
-use secp256k1::{SecretKey, ThirtyTwoByteHash};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, File};
@@ -167,7 +162,7 @@ async fn event_loop(
             .pubkey(keys.server_keys().public_key())
             .since(Timestamp::now());
 
-        client.subscribe(vec![subscription]).await;
+        client.subscribe(vec![subscription], None).await;
 
         info!("Listening for nip 47 requests...");
 
@@ -197,7 +192,7 @@ async fn event_loop(
 
                                     match tokio::time::timeout(
                                         Duration::from_secs(60),
-                                        handle_nwc_request(event, keys, config, &client, tracker, lnd),
+                                        handle_nwc_request(*event, keys, config, &client, tracker, lnd),
                                     )
                                     .await
                                     {
@@ -377,7 +372,7 @@ async fn handle_nwc_params(
             // verify amount, convert to msats
             match error_msg {
                 None => {
-                    let pubkey = secp256k1::PublicKey::from_str(&params.pubkey)?;
+                    let pubkey = bitcoin::secp256k1::PublicKey::from_str(&params.pubkey)?;
                     match pay_keysend(
                         pubkey,
                         params.preimage,
@@ -607,7 +602,7 @@ async fn pay_invoice(
 }
 
 async fn pay_keysend(
-    pubkey: secp256k1::PublicKey,
+    pubkey: bitcoin::secp256k1::PublicKey,
     preimage: Option<String>,
     tlv_records: Vec<KeysendTLVRecord>,
     amount_msats: u64,
@@ -681,8 +676,8 @@ async fn pay_keysend(
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct Nip47Keys {
-    server_key: secp256k1::SecretKey,
-    user_key: secp256k1::SecretKey,
+    server_key: SecretKey,
+    user_key: SecretKey,
     #[serde(default)]
     sent_info: bool,
 }
