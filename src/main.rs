@@ -166,6 +166,12 @@ async fn event_loop(
 
         info!("Listening for nip 47 requests...");
 
+        let (tx, mut rx) = tokio::sync::watch::channel(());
+        spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60 * 15)).await;
+            tx.send_modify(|_| ())
+        });
+
         let mut notifications = client.notifications();
         loop {
             select! {
@@ -216,7 +222,7 @@ async fn event_loop(
                         _ => {}
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(3600)) => {
+                _ = rx.changed() => {
                     break;
                 }
             }
