@@ -428,6 +428,7 @@ async fn handle_nwc_params(
                 description_hash,
                 value_msat: params.amount as i64,
                 expiry: params.expiry.unwrap_or(86_400) as i64,
+                private: config.route_hints,
                 ..Default::default()
             };
             let res = lnd.add_invoice(inv).await?.into_inner();
