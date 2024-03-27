@@ -32,6 +32,9 @@ pub struct Config {
     #[clap(long)]
     /// Path to admin.macaroon file for lnd
     macaroon_file: Option<String>,
+    #[clap(long)]
+    /// Include route hints in invoices
+    pub route_hints: bool,
 }
 
 impl Config {
