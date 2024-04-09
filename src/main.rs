@@ -322,9 +322,11 @@ async fn handle_nwc_params(
                 .or(params.amount)
                 .unwrap_or(0);
 
-            let error_msg = if msats > config.max_amount * 1_000 {
+            let error_msg = if config.max_amount > 0 && msats > config.max_amount * 1_000 {
                 Some("Invoice amount too high.")
-            } else if tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000 {
+            } else if config.daily_limit > 0
+                && tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000
+            {
                 Some("Daily limit exceeded.")
             } else {
                 None
@@ -367,9 +369,11 @@ async fn handle_nwc_params(
             d_tag = params.id.map(Tag::Identifier);
 
             let msats = params.amount;
-            let error_msg = if msats > config.max_amount * 1_000 {
+            let error_msg = if config.max_amount > 0 && msats > config.max_amount * 1_000 {
                 Some("Invoice amount too high.")
-            } else if tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000 {
+            } else if config.daily_limit > 0
+                && tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000
+            {
                 Some("Daily limit exceeded.")
             } else {
                 None
