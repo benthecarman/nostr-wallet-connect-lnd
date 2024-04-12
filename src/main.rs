@@ -3,16 +3,17 @@
 use crate::config::Config;
 use crate::payments::PaymentTracker;
 use anyhow::anyhow;
-use async_lock::RwLock;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::rand::rngs::OsRng;
-use bitcoin::secp256k1::{SecretKey, ThirtyTwoByteHash};
+use bitcoin::secp256k1::SecretKey;
+use bitcoin_30::secp256k1::ThirtyTwoByteHash;
 use clap::Parser;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescription};
 use log::{debug, error, info};
-use nostr::nips::nip47::{Request, Response};
-use nostr::prelude::*;
+use nostr::nips::nip04;
+use nostr::nips::nip47::*;
+use nostr::{Event, EventBuilder, EventId, Filter, JsonUtil, Keys, Kind, Tag, Timestamp};
 use nostr_sdk::{Client, RelayPoolNotification};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -23,7 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::{select, spawn};
 use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse, Invoice, PaymentHash};
 use tonic_openssl_lnd::{LndClient, LndLightningClient};
@@ -451,8 +452,8 @@ async fn handle_nwc_params(
         RequestParams::LookupInvoice(params) => {
             let mut invoice: Option<Bolt11Invoice> = None;
             let payment_hash: Vec<u8> = match params.payment_hash {
-                None => match params.bolt11 {
-                    None => return Err(anyhow!("Missing payment_hash or bolt11")),
+                None => match params.invoice {
+                    None => return Err(anyhow!("Missing payment_hash or invoice")),
                     Some(bolt11) => {
                         let inv = Bolt11Invoice::from_str(&bolt11)
                             .map_err(|_| anyhow!("Failed to parse invoice"))?;
@@ -627,19 +628,19 @@ async fn pay_keysend(
         .map(|rec| Ok((rec.tlv_type, FromHex::from_hex(&rec.value)?)))
         .collect::<Result<HashMap<u64, Vec<u8>>, anyhow::Error>>()?;
 
-    let payment_hash: sha256::Hash = match preimage {
+    let payment_hash: Vec<u8> = match preimage {
         None => match dest_custom_records.get(&5482373484) {
             None => {
                 let preimage = SecretKey::new(&mut OsRng).secret_bytes();
                 dest_custom_records.insert(5482373484, preimage.to_vec());
-                sha256::Hash::hash(&preimage)
+                sha256::Hash::hash(&preimage).to_byte_array().to_vec()
             }
-            Some(preimage) => sha256::Hash::hash(preimage),
+            Some(preimage) => sha256::Hash::hash(preimage).to_byte_array().to_vec(),
         },
         Some(preimage) => {
             let preimage: [u8; 32] = FromHex::from_hex(&preimage)?;
             dest_custom_records.insert(5482373484, preimage.to_vec());
-            sha256::Hash::hash(&preimage)
+            sha256::Hash::hash(&preimage).to_byte_array().to_vec()
         }
     };
 
@@ -647,7 +648,7 @@ async fn pay_keysend(
         dest: pubkey.serialize().to_vec(),
         amt_msat: amount_msats as i64,
         allow_self_payment: false,
-        payment_hash: payment_hash.into_32().to_vec(),
+        payment_hash,
         ..Default::default()
     };
 
