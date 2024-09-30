@@ -441,7 +441,7 @@ async fn handle_nwc_params(
             info!("Created invoice: {}", res.payment_request);
 
             Response {
-                result_type: Method::MakeInvoice,
+                result_type: method,
                 error: None,
                 result: Some(ResponseResult::MakeInvoice(MakeInvoiceResponseResult {
                     invoice: res.payment_request,
@@ -495,7 +495,7 @@ async fn handle_nwc_params(
             };
 
             Response {
-                result_type: Method::LookupInvoice,
+                result_type: method,
                 error: None,
                 result: Some(ResponseResult::LookupInvoice(LookupInvoiceResponseResult {
                     transaction_type: None,
@@ -518,7 +518,7 @@ async fn handle_nwc_params(
             let remaining_msats = config.daily_limit * 1_000 - tracker;
             info!("Current balance: {remaining_msats}msats");
             Response {
-                result_type: Method::GetBalance,
+                result_type: method,
                 error: None,
                 result: Some(ResponseResult::GetBalance(GetBalanceResponseResult {
                     balance: remaining_msats,
@@ -529,7 +529,7 @@ async fn handle_nwc_params(
             let lnd_info: GetInfoResponse = lnd.get_info(GetInfoRequest {}).await?.into_inner();
             info!("Getting info");
             Response {
-                result_type: Method::GetInfo,
+                result_type: method,
                 error: None,
                 result: Some(ResponseResult::GetInfo(GetInfoResponseResult {
                     alias: lnd_info.alias,
