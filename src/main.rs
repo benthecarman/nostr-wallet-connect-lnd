@@ -529,7 +529,7 @@ async fn handle_nwc_params(
             let lnd_info: GetInfoResponse = lnd.get_info(GetInfoRequest {}).await?.into_inner();
             info!("Getting info");
             Response {
-                result_type: Method::GetBalance,
+                result_type: Method::GetInfo,
                 error: None,
                 result: Some(ResponseResult::GetInfo(GetInfoResponseResult {
                     alias: lnd_info.alias,
