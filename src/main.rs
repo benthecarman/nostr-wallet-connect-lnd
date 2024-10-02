@@ -32,17 +32,6 @@ use tonic_openssl_lnd::{LndClient, LndLightningClient};
 mod config;
 mod payments;
 
-const METHODS: [Method; 8] = [
-    Method::GetInfo,
-    Method::MakeInvoice,
-    Method::GetBalance,
-    Method::LookupInvoice,
-    Method::PayInvoice,
-    Method::MultiPayInvoice,
-    Method::PayKeysend,
-    Method::MultiPayKeysend,
-];
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     pretty_env_logger::try_init()?;
@@ -59,13 +48,19 @@ async fn main() -> anyhow::Result<()> {
     .expect("failed to connect");
 
     let mut ln_client = lnd_client.lightning().clone();
-    let lnd_info: GetInfoResponse = ln_client
-        .get_info(GetInfoRequest {})
-        .await
-        .expect("Failed to get lnd info")
-        .into_inner();
 
-    info!("Connected to lnd: {}", lnd_info.identity_pubkey);
+    if !config.recv_only() {
+        // can only read info with admin.macaroon
+        let lnd_info: GetInfoResponse = ln_client
+            .get_info(GetInfoRequest {})
+            .await
+            .expect("Failed to get lnd info")
+            .into_inner();
+
+        info!("Connected to lnd: {}", lnd_info.identity_pubkey);
+    } else {
+        info!("Connected to lnd")
+    }
 
     let uri = NostrWalletConnectURI::new(
         keys.server_keys().public_key(),
@@ -106,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let active_requests = Arc::new(RwLock::new(HashSet::new()));
     let active_requests_clone = active_requests.clone();
     spawn(async move {
-        if let Err(e) = event_loop(config, keys, lnd_client, active_requests_clone).await {
+        if let Err(e) = event_loop(&config, keys, lnd_client, active_requests_clone).await {
             error!("Error: {e}");
         }
     });
@@ -129,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn event_loop(
-    config: Config,
+    config: &Config,
     mut keys: Nip47Keys,
     mut lnd_client: LndClient,
     active_requests: Arc<RwLock<HashSet<EventId>>>,
@@ -144,7 +139,7 @@ async fn event_loop(
 
         // broadcast info event
         if !keys.sent_info {
-            let content: String = METHODS
+            let content: String = methods(config)
                 .iter()
                 .map(|i| i.to_string())
                 .collect::<Vec<_>>()
@@ -312,240 +307,261 @@ async fn handle_nwc_params(
     mut lnd: LndLightningClient,
 ) -> anyhow::Result<()> {
     let mut d_tag: Option<Tag> = None;
-    let content = match params {
-        RequestParams::PayInvoice(params) => {
-            d_tag = params.id.map(Tag::Identifier);
 
-            let invoice = Bolt11Invoice::from_str(&params.invoice)
-                .map_err(|_| anyhow!("Failed to parse invoice"))?;
-            let msats = invoice
-                .amount_milli_satoshis()
-                .or(params.amount)
-                .unwrap_or(0);
+    let content;
+    if !check_nwc_permissions(config, method) {
+        content = Response {
+            result_type: method,
+            error: Some(NIP47Error {
+                code: ErrorCode::Restricted,
+                message: "Method not allowed.".to_string(),
+            }),
+            result: None,
+        };
+    } else {
+        content = match params {
+            RequestParams::PayInvoice(params) => {
+                d_tag = params.id.map(Tag::Identifier);
 
-            let error_msg = if config.max_amount > 0 && msats > config.max_amount * 1_000 {
-                Some("Invoice amount too high.")
-            } else if config.daily_limit > 0
-                && tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000
-            {
-                Some("Daily limit exceeded.")
-            } else {
-                None
-            };
+                let invoice = Bolt11Invoice::from_str(&params.invoice)
+                    .map_err(|_| anyhow!("Failed to parse invoice"))?;
+                let msats = invoice
+                    .amount_milli_satoshis()
+                    .or(params.amount)
+                    .unwrap_or(0);
 
-            // verify amount, convert to msats
-            match error_msg {
-                None => {
-                    match pay_invoice(invoice, lnd, method).await {
-                        Ok(content) => {
-                            // add payment to tracker
-                            tracker.lock().await.add_payment(msats);
-                            content
-                        }
-                        Err(e) => {
-                            error!("Error paying invoice: {e}");
+                let error_msg = if config.max_amount > 0 && msats > config.max_amount * 1_000 {
+                    Some("Invoice amount too high.")
+                } else if config.daily_limit > 0
+                    && tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000
+                {
+                    Some("Daily limit exceeded.")
+                } else {
+                    None
+                };
 
-                            Response {
-                                result_type: method,
-                                error: Some(NIP47Error {
-                                    code: ErrorCode::InsufficientBalance,
-                                    message: format!("Failed to pay invoice: {e}"),
-                                }),
-                                result: None,
+                // verify amount, convert to msats
+                match error_msg {
+                    None => {
+                        match pay_invoice(invoice, lnd, method).await {
+                            Ok(content) => {
+                                // add payment to tracker
+                                tracker.lock().await.add_payment(msats);
+                                content
+                            }
+                            Err(e) => {
+                                error!("Error paying invoice: {e}");
+
+                                Response {
+                                    result_type: method,
+                                    error: Some(NIP47Error {
+                                        code: ErrorCode::InsufficientBalance,
+                                        message: format!("Failed to pay invoice: {e}"),
+                                    }),
+                                    result: None,
+                                }
                             }
                         }
                     }
+                    Some(err_msg) => Response {
+                        result_type: method,
+                        error: Some(NIP47Error {
+                            code: ErrorCode::QuotaExceeded,
+                            message: err_msg.to_string(),
+                        }),
+                        result: None,
+                    },
                 }
-                Some(err_msg) => Response {
-                    result_type: method,
-                    error: Some(NIP47Error {
-                        code: ErrorCode::QuotaExceeded,
-                        message: err_msg.to_string(),
-                    }),
-                    result: None,
-                },
             }
-        }
-        RequestParams::PayKeysend(params) => {
-            d_tag = params.id.map(Tag::Identifier);
+            RequestParams::PayKeysend(params) => {
+                d_tag = params.id.map(Tag::Identifier);
 
-            let msats = params.amount;
-            let error_msg = if config.max_amount > 0 && msats > config.max_amount * 1_000 {
-                Some("Invoice amount too high.")
-            } else if config.daily_limit > 0
-                && tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000
-            {
-                Some("Daily limit exceeded.")
-            } else {
-                None
-            };
+                let msats = params.amount;
+                let error_msg = if config.max_amount > 0 && msats > config.max_amount * 1_000 {
+                    Some("Invoice amount too high.")
+                } else if config.daily_limit > 0
+                    && tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000
+                {
+                    Some("Daily limit exceeded.")
+                } else {
+                    None
+                };
 
-            // verify amount, convert to msats
-            match error_msg {
-                None => {
-                    let pubkey = bitcoin::secp256k1::PublicKey::from_str(&params.pubkey)?;
-                    match pay_keysend(
-                        pubkey,
-                        params.preimage,
-                        params.tlv_records,
-                        msats,
-                        lnd,
-                        method,
-                    )
-                    .await
-                    {
-                        Ok(content) => {
-                            // add payment to tracker
-                            tracker.lock().await.add_payment(msats);
-                            content
-                        }
-                        Err(e) => {
-                            error!("Error paying keysend: {e}");
+                // verify amount, convert to msats
+                match error_msg {
+                    None => {
+                        let pubkey = bitcoin::secp256k1::PublicKey::from_str(&params.pubkey)?;
+                        match pay_keysend(
+                            pubkey,
+                            params.preimage,
+                            params.tlv_records,
+                            msats,
+                            lnd,
+                            method,
+                        )
+                        .await
+                        {
+                            Ok(content) => {
+                                // add payment to tracker
+                                tracker.lock().await.add_payment(msats);
+                                content
+                            }
+                            Err(e) => {
+                                error!("Error paying keysend: {e}");
 
-                            Response {
-                                result_type: method,
-                                error: Some(NIP47Error {
-                                    code: ErrorCode::PaymentFailed,
-                                    message: format!("Failed to pay keysend: {e}"),
-                                }),
-                                result: None,
+                                Response {
+                                    result_type: method,
+                                    error: Some(NIP47Error {
+                                        code: ErrorCode::PaymentFailed,
+                                        message: format!("Failed to pay keysend: {e}"),
+                                    }),
+                                    result: None,
+                                }
                             }
                         }
                     }
+                    Some(err_msg) => Response {
+                        result_type: method,
+                        error: Some(NIP47Error {
+                            code: ErrorCode::QuotaExceeded,
+                            message: err_msg.to_string(),
+                        }),
+                        result: None,
+                    },
                 }
-                Some(err_msg) => Response {
-                    result_type: method,
-                    error: Some(NIP47Error {
-                        code: ErrorCode::QuotaExceeded,
-                        message: err_msg.to_string(),
-                    }),
-                    result: None,
-                },
             }
-        }
-        RequestParams::MakeInvoice(params) => {
-            let description_hash: Vec<u8> = match params.description_hash {
-                None => vec![],
-                Some(str) => FromHex::from_hex(&str)?,
-            };
-            let inv = Invoice {
-                memo: params.description.unwrap_or_default(),
-                description_hash,
-                value_msat: params.amount as i64,
-                expiry: params.expiry.unwrap_or(86_400) as i64,
-                private: config.route_hints,
-                ..Default::default()
-            };
-            let res = lnd.add_invoice(inv).await?.into_inner();
-
-            info!("Created invoice: {}", res.payment_request);
-
-            Response {
-                result_type: method,
-                error: None,
-                result: Some(ResponseResult::MakeInvoice(MakeInvoiceResponseResult {
-                    invoice: res.payment_request,
-                    payment_hash: ::hex::encode(res.r_hash),
-                })),
-            }
-        }
-        RequestParams::LookupInvoice(params) => {
-            let mut invoice: Option<Bolt11Invoice> = None;
-            let payment_hash: Vec<u8> = match params.payment_hash {
-                None => match params.invoice {
-                    None => return Err(anyhow!("Missing payment_hash or invoice")),
-                    Some(bolt11) => {
-                        let inv = Bolt11Invoice::from_str(&bolt11)
-                            .map_err(|_| anyhow!("Failed to parse invoice"))?;
-                        invoice = Some(inv.clone());
-                        inv.payment_hash().into_32().to_vec()
-                    }
-                },
-                Some(str) => FromHex::from_hex(&str)?,
-            };
-
-            let res = lnd
-                .lookup_invoice(PaymentHash {
-                    r_hash: payment_hash.clone(),
-                    ..Default::default()
-                })
-                .await?
-                .into_inner();
-
-            info!("Looked up invoice: {}", res.payment_request);
-
-            let (description, description_hash) = match invoice {
-                Some(inv) => match inv.description() {
-                    Bolt11InvoiceDescription::Direct(desc) => (Some(desc.to_string()), None),
-                    Bolt11InvoiceDescription::Hash(hash) => (None, Some(hash.0.to_string())),
-                },
-                None => (None, None),
-            };
-
-            let preimage = if res.r_preimage.is_empty() {
-                None
-            } else {
-                Some(hex::encode(res.r_preimage))
-            };
-
-            let settled_at = if res.settle_date == 0 {
-                None
-            } else {
-                Some(res.settle_date as u64)
-            };
-
-            Response {
-                result_type: method,
-                error: None,
-                result: Some(ResponseResult::LookupInvoice(LookupInvoiceResponseResult {
-                    transaction_type: None,
-                    invoice: Some(res.payment_request),
-                    description,
+            RequestParams::MakeInvoice(params) => {
+                let description_hash: Vec<u8> = match params.description_hash {
+                    None => vec![],
+                    Some(str) => FromHex::from_hex(&str)?,
+                };
+                let inv = Invoice {
+                    memo: params.description.unwrap_or_default(),
                     description_hash,
-                    preimage,
-                    payment_hash: hex::encode(payment_hash),
-                    amount: res.value_msat as u64,
-                    fees_paid: 0,
-                    created_at: res.creation_date as u64,
-                    expires_at: (res.creation_date + res.expiry) as u64,
-                    settled_at,
-                    metadata: Default::default(),
-                })),
+                    value_msat: params.amount as i64,
+                    expiry: params.expiry.unwrap_or(86_400) as i64,
+                    private: config.route_hints,
+                    ..Default::default()
+                };
+                let res = lnd.add_invoice(inv).await?.into_inner();
+
+                info!("Created invoice: {}", res.payment_request);
+
+                Response {
+                    result_type: method,
+                    error: None,
+                    result: Some(ResponseResult::MakeInvoice(MakeInvoiceResponseResult {
+                        invoice: res.payment_request,
+                        payment_hash: ::hex::encode(res.r_hash),
+                    })),
+                }
+            }
+            RequestParams::LookupInvoice(params) => {
+                let mut invoice: Option<Bolt11Invoice> = None;
+                let payment_hash: Vec<u8> = match params.payment_hash {
+                    None => match params.invoice {
+                        None => return Err(anyhow!("Missing payment_hash or invoice")),
+                        Some(bolt11) => {
+                            let inv = Bolt11Invoice::from_str(&bolt11)
+                                .map_err(|_| anyhow!("Failed to parse invoice"))?;
+                            invoice = Some(inv.clone());
+                            inv.payment_hash().into_32().to_vec()
+                        }
+                    },
+                    Some(str) => FromHex::from_hex(&str)?,
+                };
+
+                let res = lnd
+                    .lookup_invoice(PaymentHash {
+                        r_hash: payment_hash.clone(),
+                        ..Default::default()
+                    })
+                    .await?
+                    .into_inner();
+
+                info!("Looked up invoice: {}", res.payment_request);
+
+                let (description, description_hash) = match invoice {
+                    Some(inv) => match inv.description() {
+                        Bolt11InvoiceDescription::Direct(desc) => (Some(desc.to_string()), None),
+                        Bolt11InvoiceDescription::Hash(hash) => (None, Some(hash.0.to_string())),
+                    },
+                    None => (None, None),
+                };
+
+                let preimage = if res.r_preimage.is_empty() {
+                    None
+                } else {
+                    Some(hex::encode(res.r_preimage))
+                };
+
+                let settled_at = if res.settle_date == 0 {
+                    None
+                } else {
+                    Some(res.settle_date as u64)
+                };
+
+                Response {
+                    result_type: method,
+                    error: None,
+                    result: Some(ResponseResult::LookupInvoice(LookupInvoiceResponseResult {
+                        transaction_type: None,
+                        invoice: Some(res.payment_request),
+                        description,
+                        description_hash,
+                        preimage,
+                        payment_hash: hex::encode(payment_hash),
+                        amount: res.value_msat as u64,
+                        fees_paid: 0,
+                        created_at: res.creation_date as u64,
+                        expires_at: (res.creation_date + res.expiry) as u64,
+                        settled_at,
+                        metadata: Default::default(),
+                    })),
+                }
+            }
+            RequestParams::GetBalance => {
+                let tracker = tracker.lock().await.sum_payments();
+                let remaining_msats = config.daily_limit * 1_000 - tracker;
+                info!("Current balance: {remaining_msats}msats");
+                Response {
+                    result_type: method,
+                    error: None,
+                    result: Some(ResponseResult::GetBalance(GetBalanceResponseResult {
+                        balance: remaining_msats,
+                    })),
+                }
+            }
+            RequestParams::GetInfo => {
+                let lnd_info = if config.recv_only() {
+                    None
+                } else {
+                    Some(lnd.get_info(GetInfoRequest {}).await?.into_inner())
+                };
+                info!("Getting info");
+                Response {
+                    result_type: method,
+                    error: None,
+                    result: Some(ResponseResult::GetInfo(GetInfoResponseResult {
+                        alias: lnd_info.clone().map_or("".to_string(), |info| info.alias),
+                        color: lnd_info.clone().map_or("".to_string(), |info| info.color),
+                        pubkey: lnd_info
+                            .clone()
+                            .map_or("".to_string(), |info| info.identity_pubkey),
+                        network: "".to_string(),
+                        block_height: lnd_info.clone().map_or(0, |info| info.block_height),
+                        block_hash: lnd_info
+                            .clone()
+                            .map_or("".to_string(), |info| info.block_hash),
+                        methods: methods(config).iter().map(|i| i.to_string()).collect(),
+                    })),
+                }
+            }
+            _ => {
+                return Err(anyhow!("Command not supported"));
             }
         }
-        RequestParams::GetBalance => {
-            let tracker = tracker.lock().await.sum_payments();
-            let remaining_msats = config.daily_limit * 1_000 - tracker;
-            info!("Current balance: {remaining_msats}msats");
-            Response {
-                result_type: method,
-                error: None,
-                result: Some(ResponseResult::GetBalance(GetBalanceResponseResult {
-                    balance: remaining_msats,
-                })),
-            }
-        }
-        RequestParams::GetInfo => {
-            let lnd_info: GetInfoResponse = lnd.get_info(GetInfoRequest {}).await?.into_inner();
-            info!("Getting info");
-            Response {
-                result_type: method,
-                error: None,
-                result: Some(ResponseResult::GetInfo(GetInfoResponseResult {
-                    alias: lnd_info.alias,
-                    color: lnd_info.color,
-                    pubkey: lnd_info.identity_pubkey,
-                    network: "".to_string(),
-                    block_height: lnd_info.block_height,
-                    block_hash: lnd_info.block_hash,
-                    methods: METHODS.iter().map(|i| i.to_string()).collect(),
-                })),
-            }
-        }
-        _ => {
-            return Err(anyhow!("Command not supported"));
-        }
-    };
+    }
 
     let encrypted = nip04::encrypt(
         &keys.server_key.into(),
@@ -741,4 +757,34 @@ fn write_keys(keys: Nip47Keys, path: &Path) -> Nip47Keys {
         .expect("Could not write to file");
 
     keys
+}
+
+const METHODS: [Method; 8] = [
+    Method::GetInfo,
+    Method::MakeInvoice,
+    Method::GetBalance,
+    Method::LookupInvoice,
+    Method::PayInvoice,
+    Method::MultiPayInvoice,
+    Method::PayKeysend,
+    Method::MultiPayKeysend,
+];
+
+const RECV_ONLY_METHODS: [Method; 4] = [
+    Method::GetInfo,
+    Method::MakeInvoice,
+    Method::GetBalance,
+    Method::LookupInvoice,
+];
+
+fn methods(config: &Config) -> Vec<Method> {
+    if config.recv_only() {
+        RECV_ONLY_METHODS.to_vec()
+    } else {
+        METHODS.to_vec()
+    }
+}
+
+fn check_nwc_permissions(config: &Config, method: Method) -> bool {
+    methods(config).contains(&method)
 }

@@ -33,15 +33,32 @@ pub struct Config {
     /// Path to admin.macaroon file for lnd
     macaroon_file: Option<String>,
     #[clap(long)]
+    /// Path to invoice.macaroon file for lnd
+    invoice_macaroon_file: Option<String>,
+    #[clap(long)]
     /// Include route hints in invoices
     pub route_hints: bool,
 }
 
 impl Config {
     pub fn macaroon_file(&self) -> String {
-        self.macaroon_file
-            .clone()
-            .unwrap_or_else(|| default_macaroon_file(&self.network))
+        if self.macaroon_file.is_some() && self.invoice_macaroon_file.is_some() {
+            panic!("cannot set --macaroon-file and --invoice-macaroon-file at the same time")
+        }
+        match self.invoice_macaroon_file {
+            Some(_) => self.invoice_macaroon_file.clone().unwrap(),
+            None => self
+                .macaroon_file
+                .clone()
+                .unwrap_or_else(|| default_macaroon_file(&self.network)),
+        }
+    }
+
+    pub fn recv_only(&self) -> bool {
+        match self.invoice_macaroon_file {
+            Some(_) => true,
+            None => false,
+        }
     }
 
     pub fn cert_file(&self) -> String {
