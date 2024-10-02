@@ -31,7 +31,7 @@ pub struct Config {
     cert_file: Option<String>,
     #[clap(long)]
     /// Path to admin.macaroon file for lnd
-    admin_macaroon_file: Option<String>,
+    macaroon_file: Option<String>,
     #[clap(long)]
     /// Path to invoice.macaroon file for lnd
     invoice_macaroon_file: Option<String>,
@@ -45,7 +45,7 @@ impl Config {
         match self.invoice_macaroon_file {
             Some(_) => self.invoice_macaroon_file.clone().unwrap(),
             None => self
-                .admin_macaroon_file
+                .macaroon_file
                 .clone()
                 .unwrap_or_else(|| default_macaroon_file(&self.network)),
         }
