@@ -32,24 +32,6 @@ use tonic_openssl_lnd::{LndClient, LndLightningClient};
 mod config;
 mod payments;
 
-const METHODS: [Method; 8] = [
-    Method::GetInfo,
-    Method::MakeInvoice,
-    Method::GetBalance,
-    Method::LookupInvoice,
-    Method::PayInvoice,
-    Method::MultiPayInvoice,
-    Method::PayKeysend,
-    Method::MultiPayKeysend,
-];
-
-const RECV_ONLY_METHODS: [Method; 4] = [
-    Method::GetInfo,
-    Method::MakeInvoice,
-    Method::GetBalance,
-    Method::LookupInvoice,
-];
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     pretty_env_logger::try_init()?;
@@ -119,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let active_requests = Arc::new(RwLock::new(HashSet::new()));
     let active_requests_clone = active_requests.clone();
     spawn(async move {
-        if let Err(e) = event_loop(config, keys, lnd_client, active_requests_clone).await {
+        if let Err(e) = event_loop(&config, keys, lnd_client, active_requests_clone).await {
             error!("Error: {e}");
         }
     });
@@ -142,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn event_loop(
-    config: Config,
+    config: &Config,
     mut keys: Nip47Keys,
     mut lnd_client: LndClient,
     active_requests: Arc<RwLock<HashSet<EventId>>>,
@@ -157,9 +139,8 @@ async fn event_loop(
 
         // broadcast info event
         if !keys.sent_info {
-            let content: String = METHODS
+            let content: String = methods(config)
                 .iter()
-                .filter(|i| !config.recv_only() || RECV_ONLY_METHODS.contains(i))
                 .map(|i| i.to_string())
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -328,7 +309,7 @@ async fn handle_nwc_params(
     let mut d_tag: Option<Tag> = None;
 
     let content;
-    if config.recv_only() && !RECV_ONLY_METHODS.contains(&method) {
+    if !check_nwc_permissions(config, method) {
         content = Response {
             result_type: method,
             error: Some(NIP47Error {
@@ -552,9 +533,10 @@ async fn handle_nwc_params(
                 }
             }
             RequestParams::GetInfo => {
-                let lnd_info = match config.recv_only() {
-                    true => None,
-                    false => Some(lnd.get_info(GetInfoRequest {}).await?.into_inner()),
+                let lnd_info = if config.recv_only() {
+                    None
+                } else {
+                    Some(lnd.get_info(GetInfoRequest {}).await?.into_inner())
                 };
                 info!("Getting info");
                 Response {
@@ -571,11 +553,7 @@ async fn handle_nwc_params(
                         block_hash: lnd_info
                             .clone()
                             .map_or("".to_string(), |info| info.block_hash),
-                        methods: METHODS
-                            .iter()
-                            .filter(|i| !config.recv_only() || RECV_ONLY_METHODS.contains(i))
-                            .map(|i| i.to_string())
-                            .collect(),
+                        methods: methods(config).iter().map(|i| i.to_string()).collect(),
                     })),
                 }
             }
@@ -779,4 +757,34 @@ fn write_keys(keys: Nip47Keys, path: &Path) -> Nip47Keys {
         .expect("Could not write to file");
 
     keys
+}
+
+const METHODS: [Method; 8] = [
+    Method::GetInfo,
+    Method::MakeInvoice,
+    Method::GetBalance,
+    Method::LookupInvoice,
+    Method::PayInvoice,
+    Method::MultiPayInvoice,
+    Method::PayKeysend,
+    Method::MultiPayKeysend,
+];
+
+const RECV_ONLY_METHODS: [Method; 4] = [
+    Method::GetInfo,
+    Method::MakeInvoice,
+    Method::GetBalance,
+    Method::LookupInvoice,
+];
+
+fn methods(config: &Config) -> Vec<Method> {
+    if config.recv_only() {
+        RECV_ONLY_METHODS.to_vec()
+    } else {
+        METHODS.to_vec()
+    }
+}
+
+fn check_nwc_permissions(config: &Config, method: Method) -> bool {
+    methods(config).contains(&method)
 }
