@@ -42,6 +42,9 @@ pub struct Config {
 
 impl Config {
     pub fn macaroon_file(&self) -> String {
+        if self.macaroon_file.is_some() && self.invoice_macaroon_file.is_some() {
+            panic!("cannot set --macaroon-file and --invoice-macaroon-file at the same time")
+        }
         match self.invoice_macaroon_file {
             Some(_) => self.invoice_macaroon_file.clone().unwrap(),
             None => self
