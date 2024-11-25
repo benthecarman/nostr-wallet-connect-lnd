@@ -26,7 +26,9 @@ use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::{select, spawn};
-use tonic_openssl_lnd::lnrpc::{GetInfoRequest, GetInfoResponse, Invoice, PaymentHash};
+use tonic_openssl_lnd::lnrpc::{
+    ChannelBalanceRequest, GetInfoRequest, GetInfoResponse, Invoice, PaymentHash,
+};
 use tonic_openssl_lnd::{LndClient, LndLightningClient};
 
 mod config;
@@ -521,14 +523,30 @@ async fn handle_nwc_params(
                 }
             }
             RequestParams::GetBalance => {
-                let tracker = tracker.lock().await.sum_payments();
-                let remaining_msats = config.daily_limit * 1_000 - tracker;
-                info!("Current balance: {remaining_msats}msats");
+                let balance: u64 = if config.recv_only() {
+                    // fetch local balance from lnd
+                    let channel_balance_response = lnd
+                        .channel_balance(ChannelBalanceRequest {})
+                        .await?
+                        .into_inner();
+                    let channel_balance = channel_balance_response
+                        .local_balance
+                        .unwrap_or_default()
+                        .sat;
+                    (channel_balance * 1_000) as u64
+                } else {
+                    // calculate remaining balance based on daily limit
+                    let tracker = tracker.lock().await.sum_payments();
+                    config.daily_limit * 1_000 - tracker
+                };
+
+                info!("Current balance: {balance} msats");
+
                 Response {
                     result_type: method,
                     error: None,
                     result: Some(ResponseResult::GetBalance(GetBalanceResponseResult {
-                        balance: remaining_msats,
+                        balance,
                     })),
                 }
             }
