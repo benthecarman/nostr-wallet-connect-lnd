@@ -537,7 +537,7 @@ async fn handle_nwc_params(
                 } else {
                     // calculate remaining balance based on daily limit
                     let tracker = tracker.lock().await.sum_payments();
-                    config.daily_limit * 1_000 - tracker
+                    (config.daily_limit * 1_000).saturating_sub(tracker)
                 };
 
                 info!("Current balance: {balance} msats");
