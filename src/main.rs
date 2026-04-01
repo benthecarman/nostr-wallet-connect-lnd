@@ -332,14 +332,19 @@ async fn handle_nwc_params(
                     .or(params.amount)
                     .unwrap_or(0);
 
-                let error_msg = if config.max_amount > 0 && msats > config.max_amount * 1_000 {
-                    Some("Invoice amount too high.")
-                } else if config.daily_limit > 0
-                    && tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000
-                {
-                    Some("Daily limit exceeded.")
-                } else {
-                    None
+                // Atomically check limits and reserve the amount
+                let error_msg = {
+                    let mut tracker_guard = tracker.lock().await;
+                    if config.max_amount > 0 && msats > config.max_amount * 1_000 {
+                        Some("Invoice amount too high.")
+                    } else if config.daily_limit > 0
+                        && tracker_guard.sum_payments() + msats > config.daily_limit * 1_000
+                    {
+                        Some("Daily limit exceeded.")
+                    } else {
+                        tracker_guard.add_payment(msats);
+                        None
+                    }
                 };
 
                 // verify amount, convert to msats
@@ -347,12 +352,14 @@ async fn handle_nwc_params(
                     None => {
                         match pay_invoice(invoice, lnd, method).await {
                             Ok(content) => {
-                                // add payment to tracker
-                                tracker.lock().await.add_payment(msats);
+                                if content.error.is_some() {
+                                    tracker.lock().await.remove_payment(msats);
+                                }
                                 content
                             }
                             Err(e) => {
                                 error!("Error paying invoice: {e}");
+                                tracker.lock().await.remove_payment(msats);
 
                                 Response {
                                     result_type: method,
@@ -379,14 +386,19 @@ async fn handle_nwc_params(
                 d_tag = params.id.map(Tag::Identifier);
 
                 let msats = params.amount;
-                let error_msg = if config.max_amount > 0 && msats > config.max_amount * 1_000 {
-                    Some("Invoice amount too high.")
-                } else if config.daily_limit > 0
-                    && tracker.lock().await.sum_payments() + msats > config.daily_limit * 1_000
-                {
-                    Some("Daily limit exceeded.")
-                } else {
-                    None
+                // Atomically check limits and reserve the amount
+                let error_msg = {
+                    let mut tracker_guard = tracker.lock().await;
+                    if config.max_amount > 0 && msats > config.max_amount * 1_000 {
+                        Some("Invoice amount too high.")
+                    } else if config.daily_limit > 0
+                        && tracker_guard.sum_payments() + msats > config.daily_limit * 1_000
+                    {
+                        Some("Daily limit exceeded.")
+                    } else {
+                        tracker_guard.add_payment(msats);
+                        None
+                    }
                 };
 
                 // verify amount, convert to msats
@@ -404,12 +416,14 @@ async fn handle_nwc_params(
                         .await
                         {
                             Ok(content) => {
-                                // add payment to tracker
-                                tracker.lock().await.add_payment(msats);
+                                if content.error.is_some() {
+                                    tracker.lock().await.remove_payment(msats);
+                                }
                                 content
                             }
                             Err(e) => {
                                 error!("Error paying keysend: {e}");
+                                tracker.lock().await.remove_payment(msats);
 
                                 Response {
                                     result_type: method,

@@ -41,4 +41,10 @@ impl PaymentTracker {
         self.clean_old_payments();
         self.payments.iter().map(|p| p.amount).sum()
     }
+
+    pub fn remove_payment(&mut self, amount: u64) {
+        if let Some(pos) = self.payments.iter().rposition(|p| p.amount == amount) {
+            self.payments.remove(pos);
+        }
+    }
 }
