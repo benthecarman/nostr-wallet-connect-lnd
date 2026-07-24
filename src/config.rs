@@ -24,7 +24,7 @@ pub struct Config {
     /// Port of the GRPC server for lnd
     pub lnd_port: u32,
     #[clap(default_value_t = Network::Bitcoin, short, long)]
-    /// Network lnd is running on ["bitcoin", "testnet", "signet, "regtest"]
+    /// Network lnd is running on ["bitcoin", "testnet", "testnet4", "signet", "regtest"]
     pub network: Network,
     #[clap(long)]
     /// Path to tls.cert file for lnd
@@ -45,24 +45,22 @@ impl Config {
         if self.macaroon_file.is_some() && self.invoice_macaroon_file.is_some() {
             panic!("cannot set --macaroon-file and --invoice-macaroon-file at the same time")
         }
-        match self.invoice_macaroon_file {
-            Some(_) => self.invoice_macaroon_file.clone().unwrap(),
-            None => self
-                .macaroon_file
-                .clone()
-                .unwrap_or_else(|| default_macaroon_file(&self.network)),
-        }
+        self.invoice_macaroon_file
+            .clone()
+            .or_else(|| self.macaroon_file.clone())
+            .unwrap_or_else(|| default_macaroon_file(&self.network))
     }
 
     pub fn recv_only(&self) -> bool {
-        match self.invoice_macaroon_file {
-            Some(_) => true,
-            None => false,
-        }
+        self.invoice_macaroon_file.is_some()
     }
 
     pub fn cert_file(&self) -> String {
         self.cert_file.clone().unwrap_or_else(default_cert_file)
+    }
+
+    pub fn nwc_network_name(&self) -> &'static str {
+        network_name(&self.network)
     }
 }
 
@@ -83,17 +81,21 @@ pub fn default_cert_file() -> String {
 }
 
 pub fn default_macaroon_file(network: &Network) -> String {
-    let network_str = match network {
-        Network::Bitcoin => "mainnet",
-        Network::Testnet => "testnet",
-        Network::Signet => "signet",
-        Network::Regtest => "regtest",
-        _ => unimplemented!("Network not supported"),
-    };
+    let network_str = network_name(network);
 
     format!(
         "{}/.lnd/data/chain/bitcoin/{}/admin.macaroon",
         home_directory(),
         network_str
     )
+}
+
+fn network_name(network: &Network) -> &'static str {
+    match network {
+        Network::Bitcoin => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Testnet4 => "testnet4",
+        Network::Signet => "signet",
+        Network::Regtest => "regtest",
+    }
 }

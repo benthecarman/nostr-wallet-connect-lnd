@@ -1,4 +1,4 @@
-FROM rust:1.74-bookworm as builder
+FROM rust:1.88-bookworm AS builder
 
 WORKDIR /usr/src/app
 COPY . .
@@ -10,7 +10,7 @@ RUN apt update && apt install -y openssl pkg-config libc6 build-essential cmake 
 
 # cargo under QEMU building for ARM can consumes 10s of GBs of RAM...
 # Solution: https://users.rust-lang.org/t/cargo-uses-too-much-memory-being-run-in-qemu/76531/2
-ENV CARGO_NET_GIT_FETCH_WITH_CLI true
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 # Will build and cache the binary and dependent crates in release mode
 RUN --mount=type=cache,target=/usr/local/cargo,from=rust:latest,source=/usr/local/cargo \
