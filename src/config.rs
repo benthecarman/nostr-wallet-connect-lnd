@@ -17,6 +17,9 @@ pub struct Config {
     /// Max payment amount per day, in satoshis
     #[clap(default_value_t = 100_000, long)]
     pub daily_limit: u64,
+    /// Max routing fee per payment, in satoshis
+    #[clap(default_value_t = 1_000, long)]
+    pub max_fee: u64,
     #[clap(default_value_t = String::from("127.0.0.1"), long)]
     /// Host of the GRPC server for lnd
     pub lnd_host: String,

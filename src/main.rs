@@ -24,7 +24,7 @@ use nostr_sdk::{Client, RelayPoolNotification};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::fs::{create_dir_all, File};
+use std::fs::{create_dir_all, read, File};
 use std::io::{BufReader, Write};
 use std::path::Path;
 use std::str::FromStr;
@@ -34,14 +34,18 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::{select, spawn};
 use tonic_openssl_lnd::lnrpc::{
-    ChannelBalanceRequest, GetInfoRequest, GetInfoResponse as LndGetInfoResponse, Invoice,
-    PaymentHash,
+    payment::PaymentStatus, ChannelBalanceRequest, GetInfoRequest,
+    GetInfoResponse as LndGetInfoResponse, Invoice, Payment, PaymentFailureReason, PaymentHash,
 };
-use tonic_openssl_lnd::{LndClient, LndLightningClient};
+use tonic_openssl_lnd::routerrpc::SendPaymentRequest;
+use tonic_openssl_lnd::{LndClient, LndLightningClient, LndRouterClient};
 
 mod bip321;
 mod config;
 mod payments;
+
+const PAYMENT_TIMEOUT_SECONDS: i32 = 45;
+const KEYSEND_FINAL_CLTV_DELTA: i32 = 40;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,14 +53,12 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = Config::parse();
     let keys = get_keys(&config.keys_file);
 
-    let mut lnd_client = tonic_openssl_lnd::connect(
-        config.lnd_host.clone(),
-        config.lnd_port,
-        config.cert_file(),
-        config.macaroon_file(),
-    )
-    .await
-    .expect("failed to connect");
+    let cert = hex::encode(read(config.cert_file())?);
+    let macaroon = hex::encode(read(config.macaroon_file())?);
+    let socket = format!("{}:{}", config.lnd_host, config.lnd_port);
+    let mut lnd_client = tonic_openssl_lnd::connect(cert, macaroon, socket)
+        .await
+        .expect("failed to connect");
 
     let mut ln_client = lnd_client.lightning().clone();
 
@@ -191,6 +193,7 @@ async fn event_loop(
                                 let client = client.clone();
                                 let tracker = tracker.clone();
                                 let lnd = lnd_client.lightning().clone();
+                                let router = lnd_client.router().clone();
 
                                 spawn(async move {
                                     let event_id = event.id;
@@ -200,7 +203,9 @@ async fn event_loop(
 
                                     match tokio::time::timeout(
                                         Duration::from_secs(60),
-                                        handle_nwc_request(*event, keys, config, &client, tracker, lnd),
+                                        handle_nwc_request(
+                                            *event, keys, config, &client, tracker, lnd, router,
+                                        ),
                                     )
                                     .await
                                     {
@@ -241,6 +246,7 @@ async fn handle_nwc_request(
     client: &Client,
     tracker: Arc<Mutex<PaymentTracker>>,
     lnd: LndLightningClient,
+    router: LndRouterClient,
 ) -> anyhow::Result<()> {
     let decrypted = nip04::decrypt(
         &keys.server_key,
@@ -258,6 +264,7 @@ async fn handle_nwc_request(
             client,
             tracker,
             lnd,
+            router,
         )
         .await;
     }
@@ -272,6 +279,7 @@ async fn handle_nwc_request(
             for inv in params.invoices {
                 let params = RequestParams::PayInvoice(inv);
                 let lnd = lnd.clone();
+                let router = router.clone();
                 let tracker = tracker.clone();
                 let keys = keys.clone();
                 let config = config.clone();
@@ -279,7 +287,7 @@ async fn handle_nwc_request(
                 let event = event.clone();
                 spawn(async move {
                     handle_nwc_params(
-                        params, req.method, &event, &keys, &config, &client, tracker, lnd,
+                        params, req.method, &event, &keys, &config, &client, tracker, lnd, router,
                     )
                     .await
                 })
@@ -292,6 +300,7 @@ async fn handle_nwc_request(
             for inv in params.keysends {
                 let params = RequestParams::PayKeysend(inv);
                 let lnd = lnd.clone();
+                let router = router.clone();
                 let tracker = tracker.clone();
                 let keys = keys.clone();
                 let config = config.clone();
@@ -299,7 +308,7 @@ async fn handle_nwc_request(
                 let event = event.clone();
                 spawn(async move {
                     handle_nwc_params(
-                        params, req.method, &event, &keys, &config, &client, tracker, lnd,
+                        params, req.method, &event, &keys, &config, &client, tracker, lnd, router,
                     )
                     .await
                 })
@@ -310,7 +319,7 @@ async fn handle_nwc_request(
         }
         params => {
             handle_nwc_params(
-                params, req.method, &event, &keys, &config, client, tracker, lnd,
+                params, req.method, &event, &keys, &config, client, tracker, lnd, router,
             )
             .await
         }
@@ -351,13 +360,14 @@ async fn handle_bip321_request(
     client: &Client,
     tracker: Arc<Mutex<PaymentTracker>>,
     mut lnd: LndLightningClient,
+    mut router: LndRouterClient,
 ) -> anyhow::Result<()> {
     let allowed = method == RECEIVE_METHOD || (method == PAY_METHOD && !config.recv_only());
     let content = if !allowed {
         error_response(&method, "RESTRICTED", "Method not allowed.")
     } else if method == PAY_METHOD {
         match serde_json::from_value::<PayRequestParams>(params) {
-            Ok(params) => handle_bip321_pay(params, config, tracker, &mut lnd).await,
+            Ok(params) => handle_bip321_pay(params, config, tracker, &mut router).await,
             Err(error) => error_response(PAY_METHOD, "BAD_REQUEST", error.to_string()),
         }
     } else {
@@ -374,7 +384,7 @@ async fn handle_bip321_pay(
     params: PayRequestParams,
     config: &Config,
     tracker: Arc<Mutex<PaymentTracker>>,
-    lnd: &mut LndLightningClient,
+    router: &mut LndRouterClient,
 ) -> Value {
     if params
         .payer_note
@@ -417,18 +427,21 @@ async fn handle_bip321_pay(
 
     let created_at = Timestamp::now().as_secs();
     let payment_hash = hex::encode(invoice.payment_hash().to_byte_array());
-    let request = tonic_openssl_lnd::lnrpc::SendRequest {
+    let request = SendPaymentRequest {
         payment_request: invoice.to_string(),
         amt_msat: if invoice.amount_milli_satoshis().is_none() {
             amount as i64
         } else {
             0
         },
+        timeout_seconds: PAYMENT_TIMEOUT_SECONDS,
+        fee_limit_msat: fee_limit_msat(config.max_fee),
+        no_inflight_updates: true,
         allow_self_payment: false,
         ..Default::default()
     };
-    let response = match lnd.send_payment_sync(request).await {
-        Ok(response) => response.into_inner(),
+    let response = match send_payment(router, request).await {
+        Ok(response) => response,
         Err(error) => {
             tracker.lock().await.remove_payment(amount);
             return error_response(
@@ -439,18 +452,18 @@ async fn handle_bip321_pay(
         }
     };
 
-    if !response.payment_error.is_empty() {
+    if response.status != PaymentStatus::Succeeded as i32 {
         tracker.lock().await.remove_payment(amount);
-        return error_response(PAY_METHOD, "PAYMENT_FAILED", response.payment_error);
+        return error_response(
+            PAY_METHOD,
+            "PAYMENT_FAILED",
+            payment_failure_message(&response),
+        );
     }
 
     let settled_at = Timestamp::now().as_secs();
-    let fees_paid = response
-        .payment_route
-        .map(|route| route.total_fees_msat.max(0) as u64)
-        .unwrap_or(0);
-    let preimage =
-        (!response.payment_preimage.is_empty()).then(|| hex::encode(response.payment_preimage));
+    let fees_paid = response.fee_msat.max(0) as u64;
+    let preimage = (!response.payment_preimage.is_empty()).then_some(response.payment_preimage);
 
     success_response(
         PAY_METHOD,
@@ -571,6 +584,7 @@ async fn handle_nwc_params(
     client: &Client,
     tracker: Arc<Mutex<PaymentTracker>>,
     mut lnd: LndLightningClient,
+    mut router: LndRouterClient,
 ) -> anyhow::Result<()> {
     let mut d_tag: Option<Tag> = None;
 
@@ -616,7 +630,7 @@ async fn handle_nwc_params(
 
                 // verify amount, convert to msats
                 match error_msg {
-                    None => match pay_invoice(invoice, lnd, method).await {
+                    None => match pay_invoice(invoice, &mut router, method, config.max_fee).await {
                         Ok(content) => {
                             if content.error.is_some() {
                                 tracker.lock().await.remove_payment(msats);
@@ -675,8 +689,9 @@ async fn handle_nwc_params(
                             params.preimage,
                             params.tlv_records,
                             msats,
-                            lnd,
+                            &mut router,
                             method,
+                            config.max_fee,
                         )
                         .await
                         {
@@ -896,49 +911,85 @@ async fn handle_nwc_params(
     Ok(())
 }
 
+fn fee_limit_msat(max_fee_sats: u64) -> i64 {
+    max_fee_sats.saturating_mul(1_000).min(i64::MAX as u64) as i64
+}
+
+fn payment_failure_message(payment: &Payment) -> &'static str {
+    match payment.failure_reason() {
+        PaymentFailureReason::FailureReasonTimeout => "Payment timed out.",
+        PaymentFailureReason::FailureReasonNoRoute => "No payment route was found.",
+        PaymentFailureReason::FailureReasonError => "Payment failed with a non-recoverable error.",
+        PaymentFailureReason::FailureReasonIncorrectPaymentDetails => {
+            "The payment details are incorrect."
+        }
+        PaymentFailureReason::FailureReasonInsufficientBalance => "Insufficient local balance.",
+        PaymentFailureReason::FailureReasonCanceled => "Payment was canceled.",
+        PaymentFailureReason::FailureReasonNone => "Payment failed.",
+    }
+}
+
+async fn send_payment(
+    router: &mut LndRouterClient,
+    request: SendPaymentRequest,
+) -> anyhow::Result<Payment> {
+    let mut updates = router.send_payment_v2(request).await?.into_inner();
+
+    while let Some(payment) = updates.message().await? {
+        if matches!(
+            payment.status(),
+            PaymentStatus::Succeeded | PaymentStatus::Failed
+        ) {
+            return Ok(payment);
+        }
+    }
+
+    Err(anyhow!(
+        "payment update stream ended before a terminal status"
+    ))
+}
+
 async fn pay_invoice(
     ln_invoice: Bolt11Invoice,
-    mut lnd: LndLightningClient,
+    router: &mut LndRouterClient,
     method: Method,
+    max_fee_sats: u64,
 ) -> anyhow::Result<Response> {
     debug!("paying invoice: {ln_invoice}");
 
-    let req = tonic_openssl_lnd::lnrpc::SendRequest {
+    let req = SendPaymentRequest {
         payment_request: ln_invoice.to_string(),
+        timeout_seconds: PAYMENT_TIMEOUT_SECONDS,
+        fee_limit_msat: fee_limit_msat(max_fee_sats),
+        no_inflight_updates: true,
         allow_self_payment: false,
         ..Default::default()
     };
 
-    let response = lnd.send_payment_sync(req).await?.into_inner();
+    let response = send_payment(router, req).await?;
 
-    let payment_error = if response.payment_error.is_empty() {
-        None
-    } else {
-        Some(response.payment_error)
-    };
-
-    let response = match payment_error {
-        None => {
+    let response = match response.status() {
+        PaymentStatus::Succeeded => {
             info!("paid invoice: {}", ln_invoice.payment_hash());
 
-            let preimage = ::hex::encode(response.payment_preimage);
             Response {
                 result_type: method,
                 error: None,
                 result: Some(ResponseResult::PayInvoice(PayInvoiceResponse {
-                    preimage,
-                    fees_paid: None,
+                    preimage: response.payment_preimage,
+                    fees_paid: Some(response.fee_msat.max(0) as u64),
                 })),
             }
         }
-        Some(error_msg) => Response {
+        PaymentStatus::Failed => Response {
             result_type: method,
             error: Some(NIP47Error {
                 code: ErrorCode::PaymentFailed,
-                message: error_msg,
+                message: payment_failure_message(&response).to_string(),
             }),
             result: None,
         },
+        _ => unreachable!("send_payment only returns terminal payment states"),
     };
 
     Ok(response)
@@ -949,11 +1000,49 @@ async fn pay_keysend(
     preimage: Option<String>,
     tlv_records: Vec<KeysendTLVRecord>,
     amount_msats: u64,
-    mut lnd: LndLightningClient,
+    router: &mut LndRouterClient,
     method: Method,
+    max_fee_sats: u64,
 ) -> anyhow::Result<Response> {
     debug!("paying keysend to {pubkey} for {amount_msats}msats");
 
+    let req = keysend_request(&pubkey, preimage, tlv_records, amount_msats, max_fee_sats)?;
+    let response = send_payment(router, req).await?;
+
+    let response = match response.status() {
+        PaymentStatus::Succeeded => {
+            info!("paid keysend to {pubkey} for {amount_msats}msats");
+
+            Response {
+                result_type: method,
+                error: None,
+                result: Some(ResponseResult::PayKeysend(PayKeysendResponse {
+                    preimage: response.payment_preimage,
+                    fees_paid: Some(response.fee_msat.max(0) as u64),
+                })),
+            }
+        }
+        PaymentStatus::Failed => Response {
+            result_type: method,
+            error: Some(NIP47Error {
+                code: ErrorCode::PaymentFailed,
+                message: payment_failure_message(&response).to_string(),
+            }),
+            result: None,
+        },
+        _ => unreachable!("send_payment only returns terminal payment states"),
+    };
+
+    Ok(response)
+}
+
+fn keysend_request(
+    pubkey: &bitcoin::secp256k1::PublicKey,
+    preimage: Option<String>,
+    tlv_records: Vec<KeysendTLVRecord>,
+    amount_msats: u64,
+    max_fee_sats: u64,
+) -> anyhow::Result<SendPaymentRequest> {
     let mut dest_custom_records = tlv_records
         .into_iter()
         .map(|rec| Ok((rec.tlv_type, FromHex::from_hex(&rec.value)?)))
@@ -975,47 +1064,19 @@ async fn pay_keysend(
         }
     };
 
-    let req = tonic_openssl_lnd::lnrpc::SendRequest {
+    Ok(SendPaymentRequest {
         dest: pubkey.serialize().to_vec(),
-        amt_msat: amount_msats as i64,
+        amt_msat: i64::try_from(amount_msats)
+            .map_err(|_| anyhow!("keysend amount is out of range"))?,
+        final_cltv_delta: KEYSEND_FINAL_CLTV_DELTA,
+        timeout_seconds: PAYMENT_TIMEOUT_SECONDS,
+        fee_limit_msat: fee_limit_msat(max_fee_sats),
+        dest_custom_records,
+        no_inflight_updates: true,
         allow_self_payment: false,
         payment_hash,
         ..Default::default()
-    };
-
-    let response = lnd.send_payment_sync(req).await?.into_inner();
-
-    let payment_error = if response.payment_error.is_empty() {
-        None
-    } else {
-        Some(response.payment_error)
-    };
-
-    let response = match payment_error {
-        None => {
-            info!("paid keysend to {pubkey} for {amount_msats}msats");
-
-            let preimage = ::hex::encode(response.payment_preimage);
-            Response {
-                result_type: method,
-                error: None,
-                result: Some(ResponseResult::PayKeysend(PayKeysendResponse {
-                    preimage,
-                    fees_paid: None,
-                })),
-            }
-        }
-        Some(error_msg) => Response {
-            result_type: method,
-            error: Some(NIP47Error {
-                code: ErrorCode::PaymentFailed,
-                message: error_msg,
-            }),
-            result: None,
-        },
-    };
-
-    Ok(response)
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1130,6 +1191,7 @@ mod tests {
     #[test]
     fn advertises_bip321_methods_according_to_permissions() {
         let config = Config::try_parse_from(["nwc-lnd", "--relay", "wss://relay.example"]).unwrap();
+        assert_eq!(config.max_fee, 1_000);
         let advertised = advertised_methods(&config);
         assert!(advertised.contains(&PAY_METHOD.to_string()));
         assert!(advertised.contains(&RECEIVE_METHOD.to_string()));
@@ -1145,6 +1207,43 @@ mod tests {
         let advertised = advertised_methods(&recv_only);
         assert!(!advertised.contains(&PAY_METHOD.to_string()));
         assert!(advertised.contains(&RECEIVE_METHOD.to_string()));
+    }
+
+    #[test]
+    fn builds_lnd_021_keysend_request_with_preimage_tlv_and_limits() {
+        let pubkey = bitcoin::secp256k1::PublicKey::from_str(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let preimage = [1_u8; 32];
+
+        let request =
+            keysend_request(&pubkey, Some(hex::encode(preimage)), Vec::new(), 42_000, 7).unwrap();
+
+        assert_eq!(request.amt_msat, 42_000);
+        assert_eq!(request.timeout_seconds, PAYMENT_TIMEOUT_SECONDS);
+        assert_eq!(request.fee_limit_msat, 7_000);
+        assert_eq!(request.final_cltv_delta, KEYSEND_FINAL_CLTV_DELTA);
+        assert!(request.no_inflight_updates);
+        assert_eq!(
+            request.dest_custom_records.get(&5482373484),
+            Some(&preimage.to_vec())
+        );
+        assert_eq!(
+            request.payment_hash,
+            sha256::Hash::hash(&preimage).to_byte_array()
+        );
+    }
+
+    #[test]
+    fn rejects_keysend_amounts_that_do_not_fit_lnd_request() {
+        let pubkey = bitcoin::secp256k1::PublicKey::from_str(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+
+        let error = keysend_request(&pubkey, None, Vec::new(), u64::MAX, 1).unwrap_err();
+        assert_eq!(error.to_string(), "keysend amount is out of range");
     }
 
     #[test]

@@ -18,6 +18,9 @@ nostr-wallet-connect-lnd --relay wss://relay.damus.io --lnd-host localhost --lnd
 This will print a wallet connect uri to the console. Scan this with your wallet connect enabled wallet.
 You may need to use a tool to turn the uri into a QR code.
 
+Outgoing payments use a maximum routing fee of 1,000 satoshis by default. Set a
+different limit with `--max-fee <SATS>`.
+
 ## BIP-321 support
 
 The service advertises and supports the optional NWC `pay` and `receive` methods from
