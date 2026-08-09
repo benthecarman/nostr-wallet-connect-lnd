@@ -33,7 +33,7 @@ pub struct Config {
     /// Path to tls.cert file for lnd
     cert_file: Option<String>,
     #[clap(long)]
-    /// Path to admin.macaroon file for lnd
+    /// Path to the macaroon file for lnd (use a custom macaroon with only the required permissions; see README)
     macaroon_file: Option<String>,
     #[clap(long)]
     /// Path to invoice.macaroon file for lnd

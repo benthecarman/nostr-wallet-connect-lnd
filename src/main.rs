@@ -15,6 +15,7 @@ use clap::Parser;
 use lightning_invoice::{Bolt11Invoice, Bolt11InvoiceDescriptionRef};
 use log::{debug, error, info};
 use nostr::nips::nip04;
+use nostr::nips::nip44;
 use nostr::nips::nip47::*;
 use nostr::{
     Event, EventBuilder, EventId, Filter, JsonUtil, Keys, Kind, SecretKey as NostrSecretKey, Tag,
@@ -29,7 +30,7 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::{select, spawn};
@@ -63,14 +64,15 @@ async fn main() -> anyhow::Result<()> {
     let mut ln_client = lnd_client.lightning().clone();
 
     if !config.recv_only() {
-        // can only read info with admin.macaroon
-        let lnd_info: LndGetInfoResponse = ln_client
-            .get_info(GetInfoRequest {})
-            .await
-            .expect("Failed to get lnd info")
-            .into_inner();
-
-        info!("Connected to lnd: {}", lnd_info.identity_pubkey);
+        // get_info needs the info:read permission. A least-privilege macaroon
+        // may not have it, so do not fail startup over it.
+        match ln_client.get_info(GetInfoRequest {}).await {
+            Ok(lnd_info) => {
+                let lnd_info: LndGetInfoResponse = lnd_info.into_inner();
+                info!("Connected to lnd: {}", lnd_info.identity_pubkey);
+            }
+            Err(e) => info!("Connected to lnd (get_info not permitted: {e})"),
+        }
     } else {
         info!("Connected to lnd")
     }
@@ -81,7 +83,10 @@ async fn main() -> anyhow::Result<()> {
         keys.user_key.clone(),
         None,
     );
-    info!("\n{uri}\n");
+    // Print the URI directly to the terminal, not through the logging
+    // framework. The URI holds a secret and must not go to log appenders
+    // or aggregators.
+    println!("\n{uri}\n");
 
     debug!("server pubkey: {}", keys.user_keys().public_key());
 
@@ -143,6 +148,10 @@ async fn event_loop(
     active_requests: Arc<RwLock<HashSet<EventId>>>,
 ) -> anyhow::Result<()> {
     let tracker = Arc::new(Mutex::new(PaymentTracker::new()));
+    // Event IDs that were already processed. A relay can deliver the same
+    // request more than once; a replayed pay_keysend would pay again because
+    // each try creates a new random preimage.
+    let handled_events = Arc::new(Mutex::new(HashMap::<EventId, Instant>::new()));
     let mut sent_info = false;
     // loop in case we get disconnected
     loop {
@@ -186,6 +195,26 @@ async fn event_loop(
                                 && event.pubkey == keys.user_keys().public_key()
                                 && event.verify().is_ok()
                             {
+                                // Drop events older than 24 hours. A newer
+                                // event that was processed before is in the
+                                // handled-events cache below, so an old event
+                                // can only be a replay or a backdated event.
+                                let cutoff = Timestamp::now().as_secs().saturating_sub(86_400);
+                                if event.created_at.as_secs() < cutoff {
+                                    debug!("Ignoring event older than 24h: {}", event.id);
+                                    continue;
+                                }
+
+                                // Drop events that were handled before.
+                                let mut handled = handled_events.lock().await;
+                                handled
+                                    .retain(|_, seen_at| seen_at.elapsed() < Duration::from_secs(86_400));
+                                if handled.insert(event.id, Instant::now()).is_some() {
+                                    debug!("Ignoring already handled event: {}", event.id);
+                                    continue;
+                                }
+                                drop(handled);
+
                                 debug!("Received event!");
                                 let active_requests = active_requests.clone();
                                 let keys = keys.clone();
@@ -239,6 +268,42 @@ async fn event_loop(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Encryption {
+    Nip04,
+    Nip44,
+}
+
+/// Decrypt a request and detect its encryption scheme. NIP-04 payloads
+/// contain "?iv="; anything else is treated as NIP-44 v2.
+fn decrypt_request_content(
+    keys: &Nip47Keys,
+    content: &str,
+) -> anyhow::Result<(String, Encryption)> {
+    let user_pubkey = keys.user_keys().public_key();
+    if content.contains("?iv=") {
+        let decrypted = nip04::decrypt(&keys.server_key, &user_pubkey, content)?;
+        Ok((decrypted, Encryption::Nip04))
+    } else {
+        let decrypted = nip44::decrypt(&keys.server_key, &user_pubkey, content)?;
+        Ok((decrypted, Encryption::Nip44))
+    }
+}
+
+/// Encrypt a response with the same scheme that the request used.
+fn encrypt_content(scheme: Encryption, keys: &Nip47Keys, content: &str) -> anyhow::Result<String> {
+    let user_pubkey = keys.user_keys().public_key();
+    match scheme {
+        Encryption::Nip04 => Ok(nip04::encrypt(&keys.server_key, &user_pubkey, content)?),
+        Encryption::Nip44 => Ok(nip44::encrypt(
+            &keys.server_key,
+            &user_pubkey,
+            content,
+            nip44::Version::V2,
+        )?),
+    }
+}
+
 async fn handle_nwc_request(
     event: Event,
     keys: Nip47Keys,
@@ -248,11 +313,7 @@ async fn handle_nwc_request(
     lnd: LndLightningClient,
     router: LndRouterClient,
 ) -> anyhow::Result<()> {
-    let decrypted = nip04::decrypt(
-        &keys.server_key,
-        &keys.user_keys().public_key(),
-        &event.content,
-    )?;
+    let (decrypted, scheme) = decrypt_request_content(&keys, &event.content)?;
     let envelope: RequestEnvelope = serde_json::from_str(&decrypted)?;
     if matches!(envelope.method.as_str(), PAY_METHOD | RECEIVE_METHOD) {
         return handle_bip321_request(
@@ -265,6 +326,7 @@ async fn handle_nwc_request(
             tracker,
             lnd,
             router,
+            scheme,
         )
         .await;
     }
@@ -288,6 +350,7 @@ async fn handle_nwc_request(
                 spawn(async move {
                     handle_nwc_params(
                         params, req.method, &event, &keys, &config, &client, tracker, lnd, router,
+                        scheme,
                     )
                     .await
                 })
@@ -309,6 +372,7 @@ async fn handle_nwc_request(
                 spawn(async move {
                     handle_nwc_params(
                         params, req.method, &event, &keys, &config, &client, tracker, lnd, router,
+                        scheme,
                     )
                     .await
                 })
@@ -319,7 +383,7 @@ async fn handle_nwc_request(
         }
         params => {
             handle_nwc_params(
-                params, req.method, &event, &keys, &config, client, tracker, lnd, router,
+                params, req.method, &event, &keys, &config, client, tracker, lnd, router, scheme,
             )
             .await
         }
@@ -361,6 +425,7 @@ async fn handle_bip321_request(
     tracker: Arc<Mutex<PaymentTracker>>,
     mut lnd: LndLightningClient,
     mut router: LndRouterClient,
+    scheme: Encryption,
 ) -> anyhow::Result<()> {
     let allowed = method == RECEIVE_METHOD || (method == PAY_METHOD && !config.recv_only());
     let content = if !allowed {
@@ -377,7 +442,7 @@ async fn handle_bip321_request(
         }
     };
 
-    send_json_response(event, keys, client, content).await
+    send_json_response(event, keys, client, content, scheme).await
 }
 
 async fn handle_bip321_pay(
@@ -533,12 +598,9 @@ async fn send_json_response(
     keys: &Nip47Keys,
     client: &Client,
     content: Value,
+    scheme: Encryption,
 ) -> anyhow::Result<()> {
-    let encrypted = nip04::encrypt(
-        &keys.server_key,
-        &keys.user_keys().public_key(),
-        content.to_string(),
-    )?;
+    let encrypted = encrypt_content(scheme, keys, &content.to_string())?;
     let tags = vec![Tag::public_key(event.pubkey), Tag::event(event.id)];
     let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
         .tags(tags)
@@ -553,6 +615,7 @@ async fn handle_get_info(
     config: &Config,
     client: &Client,
     lnd: &mut LndLightningClient,
+    scheme: Encryption,
 ) -> anyhow::Result<()> {
     let lnd_info = if config.recv_only() {
         None
@@ -572,7 +635,7 @@ async fn handle_get_info(
             notifications: Vec::new(),
         },
     );
-    send_json_response(event, keys, client, content).await
+    send_json_response(event, keys, client, content, scheme).await
 }
 
 async fn handle_nwc_params(
@@ -585,11 +648,12 @@ async fn handle_nwc_params(
     tracker: Arc<Mutex<PaymentTracker>>,
     mut lnd: LndLightningClient,
     mut router: LndRouterClient,
+    scheme: Encryption,
 ) -> anyhow::Result<()> {
     let mut d_tag: Option<Tag> = None;
 
     if check_nwc_permissions(config, method) && matches!(&params, RequestParams::GetInfo) {
-        return handle_get_info(event, keys, config, client, &mut lnd).await;
+        return handle_get_info(event, keys, config, client, &mut lnd, scheme).await;
     }
 
     let content = if !check_nwc_permissions(config, method) {
@@ -665,65 +729,78 @@ async fn handle_nwc_params(
                 d_tag = params.id.map(Tag::identifier);
 
                 let msats = params.amount;
-                // Atomically check limits and reserve the amount
-                let error_msg = {
-                    let mut tracker_guard = tracker.lock().await;
-                    if config.max_amount > 0 && msats > config.max_amount * 1_000 {
-                        Some("Invoice amount too high.")
-                    } else if config.daily_limit > 0
-                        && tracker_guard.sum_payments() + msats > config.daily_limit * 1_000
-                    {
-                        Some("Daily limit exceeded.")
-                    } else {
-                        tracker_guard.add_payment(msats);
-                        None
-                    }
-                };
-
-                // verify amount, convert to msats
-                match error_msg {
-                    None => {
-                        let pubkey = bitcoin::secp256k1::PublicKey::from_str(&params.pubkey)?;
-                        match pay_keysend(
-                            pubkey,
-                            params.preimage,
-                            params.tlv_records,
-                            msats,
-                            &mut router,
-                            method,
-                            config.max_fee,
-                        )
-                        .await
-                        {
-                            Ok(content) => {
-                                if content.error.is_some() {
-                                    tracker.lock().await.remove_payment(msats);
-                                }
-                                content
-                            }
-                            Err(e) => {
-                                error!("Error paying keysend: {e}");
-                                tracker.lock().await.remove_payment(msats);
-
-                                Response {
-                                    result_type: method,
-                                    error: Some(NIP47Error {
-                                        code: ErrorCode::PaymentFailed,
-                                        message: format!("Failed to pay keysend: {e}"),
-                                    }),
-                                    result: None,
-                                }
-                            }
-                        }
-                    }
-                    Some(err_msg) => Response {
+                // Validate the pubkey before any budget is reserved. A bad
+                // pubkey must not hold the reserved amount for a day.
+                match bitcoin::secp256k1::PublicKey::from_str(&params.pubkey) {
+                    Err(_) => Response {
                         result_type: method,
                         error: Some(NIP47Error {
-                            code: ErrorCode::QuotaExceeded,
-                            message: err_msg.to_string(),
+                            code: ErrorCode::Other,
+                            message: format!("Invalid pubkey: {}", params.pubkey),
                         }),
                         result: None,
                     },
+                    Ok(pubkey) => {
+                        // Atomically check limits and reserve the amount
+                        let error_msg = {
+                            let mut tracker_guard = tracker.lock().await;
+                            if config.max_amount > 0 && msats > config.max_amount * 1_000 {
+                                Some("Invoice amount too high.")
+                            } else if config.daily_limit > 0
+                                && tracker_guard.sum_payments() + msats > config.daily_limit * 1_000
+                            {
+                                Some("Daily limit exceeded.")
+                            } else {
+                                tracker_guard.add_payment(msats);
+                                None
+                            }
+                        };
+
+                        // verify amount, convert to msats
+                        match error_msg {
+                            None => {
+                                match pay_keysend(
+                                    pubkey,
+                                    params.preimage,
+                                    params.tlv_records,
+                                    msats,
+                                    &mut router,
+                                    method,
+                                    config.max_fee,
+                                )
+                                .await
+                                {
+                                    Ok(content) => {
+                                        if content.error.is_some() {
+                                            tracker.lock().await.remove_payment(msats);
+                                        }
+                                        content
+                                    }
+                                    Err(e) => {
+                                        error!("Error paying keysend: {e}");
+                                        tracker.lock().await.remove_payment(msats);
+
+                                        Response {
+                                            result_type: method,
+                                            error: Some(NIP47Error {
+                                                code: ErrorCode::PaymentFailed,
+                                                message: format!("Failed to pay keysend: {e}"),
+                                            }),
+                                            result: None,
+                                        }
+                                    }
+                                }
+                            }
+                            Some(err_msg) => Response {
+                                result_type: method,
+                                error: Some(NIP47Error {
+                                    code: ErrorCode::QuotaExceeded,
+                                    message: err_msg.to_string(),
+                                }),
+                                result: None,
+                            },
+                        }
+                    }
                 }
             }
             RequestParams::MakeInvoice(params) => {
@@ -891,11 +968,7 @@ async fn handle_nwc_params(
         }
     };
 
-    let encrypted = nip04::encrypt(
-        &keys.server_key,
-        &keys.user_keys().public_key(),
-        content.as_json(),
-    )?;
+    let encrypted = encrypt_content(scheme, keys, &content.as_json())?;
     let p_tag = Tag::public_key(event.pubkey);
     let e_tag = Tag::event(event.id);
     let tags = match d_tag {
@@ -1118,6 +1191,7 @@ fn get_keys(keys_file: &str) -> Nip47Keys {
     let path = Path::new(keys_file);
     match File::open(path) {
         Ok(file) => {
+            warn_on_permissive_keys_file(keys_file, &file);
             let reader = BufReader::new(file);
             serde_json::from_reader(reader).expect("Could not parse JSON")
         }
@@ -1128,6 +1202,21 @@ fn get_keys(keys_file: &str) -> Nip47Keys {
     }
 }
 
+// The keys file holds the full NWC secret. Warn if other users can read it.
+#[cfg(unix)]
+fn warn_on_permissive_keys_file(keys_file: &str, file: &File) {
+    use std::os::unix::fs::MetadataExt;
+
+    if let Ok(metadata) = file.metadata() {
+        if metadata.mode() & 0o077 != 0 {
+            error!("{keys_file} is readable by other users; run: chmod 600 {keys_file}");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_on_permissive_keys_file(_keys_file: &str, _file: &File) {}
+
 fn write_keys(keys: Nip47Keys, path: &Path) -> Nip47Keys {
     let json_str = serde_json::to_string(&keys).expect("Could not serialize data");
 
@@ -1135,7 +1224,15 @@ fn write_keys(keys: Nip47Keys, path: &Path) -> Nip47Keys {
         create_dir_all(parent).expect("Could not create directory");
     }
 
-    let mut file = File::create(path).expect("Could not create file");
+    let mut options = File::options();
+    options.write(true).create(true).truncate(true);
+    // The file holds the full NWC secret; only the owner may read or write it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).expect("Could not create file");
     file.write_all(json_str.as_bytes())
         .expect("Could not write to file");
 
@@ -1244,6 +1341,55 @@ mod tests {
 
         let error = keysend_request(&pubkey, None, Vec::new(), u64::MAX, 1).unwrap_err();
         assert_eq!(error.to_string(), "keysend amount is out of range");
+    }
+
+    #[test]
+    fn detects_request_encryption_scheme() {
+        let keys = Nip47Keys::generate();
+        let user_pubkey = keys.user_keys().public_key();
+        let content = r#"{"method":"get_balance","params":{}}"#;
+
+        let encrypted = nip04::encrypt(&keys.server_key, &user_pubkey, content).unwrap();
+        let (decrypted, scheme) = decrypt_request_content(&keys, &encrypted).unwrap();
+        assert_eq!(decrypted, content);
+        assert!(matches!(scheme, Encryption::Nip04));
+
+        let encrypted =
+            nip44::encrypt(&keys.server_key, &user_pubkey, content, nip44::Version::V2).unwrap();
+        let (decrypted, scheme) = decrypt_request_content(&keys, &encrypted).unwrap();
+        assert_eq!(decrypted, content);
+        assert!(matches!(scheme, Encryption::Nip44));
+    }
+
+    #[test]
+    fn encrypts_responses_with_the_request_scheme() {
+        let keys = Nip47Keys::generate();
+        let content = r#"{"result_type":"get_balance"}"#;
+
+        for scheme in [Encryption::Nip04, Encryption::Nip44] {
+            let encrypted = encrypt_content(scheme, &keys, content).unwrap();
+            let (decrypted, detected) = decrypt_request_content(&keys, &encrypted).unwrap();
+            assert_eq!(decrypted, content);
+            assert!(matches!(
+                (scheme, detected),
+                (Encryption::Nip04, Encryption::Nip04) | (Encryption::Nip44, Encryption::Nip44)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_keys_file_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("nwc-keys-test-{}", std::process::id()));
+        let path = dir.join("keys.json");
+        write_keys(Nip47Keys::generate(), &path);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

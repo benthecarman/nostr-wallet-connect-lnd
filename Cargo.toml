@@ -12,7 +12,7 @@ home = "0.5.12"
 bitcoin = { version = "0.32.102", features = ["rand", "rand-std"] }
 bitcoin-payment-instructions = "0.7.0"
 lightning-invoice = { version = "0.34.1", features = ["serde", "std"] }
-nostr = { version = "0.44.4", features = ["nip47"] }
+nostr = { version = "0.44.4", features = ["nip44", "nip47"] }
 nostr-sdk = { version = "0.44.1", features = ["nip47"] }
 tonic_openssl_lnd = { package = "lnd_grpc_rust", version = "2.16.0" }
 tokio = { version = "1.53.1", features = ["full"] }
