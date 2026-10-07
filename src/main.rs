@@ -566,7 +566,13 @@ async fn handle_bip321_pay(
         allow_self_payment: false,
         ..Default::default()
     };
-    let result = match send_payment(router, request).await {
+    let result = match send_or_find_payment(
+        router,
+        request,
+        &invoice.payment_hash().to_byte_array(),
+    )
+    .await
+    {
         Ok(response) if response.status() == PaymentStatus::Succeeded => Ok(response),
         Ok(response) => Err(payment_failure(&response, params.max_fee.is_some())),
         Err(error) => Err(send_payment_error(&error, "Failed to pay invoice")),
@@ -1146,17 +1152,54 @@ fn send_payment_error(error: &anyhow::Error, context: &str) -> NwcError {
 }
 
 fn pre_routing_error_code(status: &tonic::Status) -> Option<&'static str> {
+    // A payment for this hash already exists and can still succeed, so
+    // something may have been sent.
+    if is_existing_payment(status) {
+        return None;
+    }
     let message = status.message().to_ascii_lowercase();
     if message.contains("insufficient") && message.contains("balance") {
         Some(INSUFFICIENT_BALANCE)
-    } else if message.contains("invoice expired")
-        || message.contains("already paid")
-        || message.contains("payment is in transition")
-        || status.code() == tonic::Code::InvalidArgument
-    {
+    } else if message.contains("invoice expired") || status.code() == tonic::Code::InvalidArgument {
         Some(BAD_REQUEST)
     } else {
         None
+    }
+}
+
+/// LND refuses a payment because a payment for this hash is already paid
+/// ("invoice is already paid") or in flight ("payment is in transition").
+fn is_existing_payment(status: &tonic::Status) -> bool {
+    let message = status.message().to_ascii_lowercase();
+    status.code() == tonic::Code::AlreadyExists
+        || message.contains("already paid")
+        || message.contains("payment is in transition")
+}
+
+/// Send a payment. If LND refuses it because a payment for this hash
+/// already exists, return that payment when it has succeeded, so a client
+/// that retries gets the preimage. Otherwise return LND's error.
+async fn send_or_find_payment(
+    router: &mut LndRouterClient,
+    request: SendPaymentRequest,
+    payment_hash: &[u8],
+) -> anyhow::Result<Payment> {
+    let error = match send_payment(router, request).await {
+        Ok(payment) => return Ok(payment),
+        Err(error) => error,
+    };
+    if !error
+        .downcast_ref::<tonic::Status>()
+        .is_some_and(is_existing_payment)
+    {
+        return Err(error);
+    }
+    match lookup_payment(router, payment_hash).await {
+        Ok(Some(payment)) if payment.status() == PaymentStatus::Succeeded => {
+            info!("payment {} was already paid", hex::encode(payment_hash));
+            Ok(payment)
+        }
+        _ => Err(error),
     }
 }
 
@@ -1200,7 +1243,8 @@ async fn pay_invoice(
         ..Default::default()
     };
 
-    let response = send_payment(router, req)
+    let payment_hash = ln_invoice.payment_hash().to_byte_array();
+    let response = send_or_find_payment(router, req, &payment_hash)
         .await
         .map_err(|e| send_payment_error(&e, "Failed to pay invoice"))?;
     if response.status() != PaymentStatus::Succeeded {
@@ -1222,7 +1266,8 @@ async fn pay_keysend(
 ) -> Result<ResponseResult, NwcError> {
     debug!("paying keysend to {pubkey} for {amount_msats}msats");
 
-    let response = send_payment(router, request)
+    let payment_hash = request.payment_hash.clone();
+    let response = send_or_find_payment(router, request, &payment_hash)
         .await
         .map_err(|e| send_payment_error(&e, "Failed to pay keysend"))?;
     if response.status() != PaymentStatus::Succeeded {
@@ -1519,11 +1564,11 @@ mod tests {
 
         assert_eq!(
             code(tonic::Status::already_exists("invoice is already paid")),
-            BAD_REQUEST
+            PAYMENT_FAILED
         );
         assert_eq!(
             code(tonic::Status::already_exists("payment is in transition")),
-            BAD_REQUEST
+            PAYMENT_FAILED
         );
         assert_eq!(
             code(tonic::Status::unknown(
@@ -1543,6 +1588,31 @@ mod tests {
             send_payment_error(&anyhow!("stream ended"), "Failed").code,
             PAYMENT_FAILED
         );
+    }
+
+    #[test]
+    fn existing_payments_are_not_pre_routing_errors() {
+        let existing = [
+            tonic::Status::already_exists("invoice is already paid"),
+            tonic::Status::already_exists("payment is in transition"),
+            // Matched by message too, for LND versions with another code.
+            tonic::Status::unknown("invoice is already paid"),
+            tonic::Status::unknown("payment is in transition"),
+            // The code wins even when the message looks like a pre-routing
+            // error.
+            tonic::Status::already_exists("insufficient local balance"),
+        ];
+        for status in existing {
+            assert!(is_existing_payment(&status), "{status}");
+            assert_eq!(pre_routing_error_code(&status), None, "{status}");
+        }
+
+        assert!(!is_existing_payment(&tonic::Status::unknown(
+            "insufficient local balance"
+        )));
+        assert!(!is_existing_payment(&tonic::Status::invalid_argument(
+            "invoice expired"
+        )));
     }
 
     #[test]
