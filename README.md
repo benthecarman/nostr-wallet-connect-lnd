@@ -32,8 +32,11 @@ lncli bakemacaroon --save_to=~/.lnd/nwc.macaroon \
   uri:/lnrpc.Lightning/AddInvoice \
   uri:/lnrpc.Lightning/LookupInvoice \
   uri:/lnrpc.Lightning/ChannelBalance \
-  uri:/routerrpc.Router/SendPaymentV2
+  uri:/routerrpc.Router/SendPaymentV2 \
+  uri:/routerrpc.Router/TrackPaymentV2
 ```
+
+`TrackPaymentV2` lets `lookup_invoice` find outgoing payments.
 
 For a receive-only setup, use `--invoice-macaroon-file` with the `invoice.macaroon`
 that lnd creates. Send permissions are then disabled.

@@ -35,10 +35,10 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::{select, spawn};
 use tonic_openssl_lnd::lnrpc::{
-    payment::PaymentStatus, ChannelBalanceRequest, GetInfoRequest,
+    htlc_attempt::HtlcStatus, payment::PaymentStatus, ChannelBalanceRequest, GetInfoRequest,
     GetInfoResponse as LndGetInfoResponse, Invoice, Payment, PaymentFailureReason, PaymentHash,
 };
-use tonic_openssl_lnd::routerrpc::SendPaymentRequest;
+use tonic_openssl_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use tonic_openssl_lnd::{LndClient, LndLightningClient, LndRouterClient};
 
 mod bip321;
@@ -47,6 +47,19 @@ mod payments;
 
 const PAYMENT_TIMEOUT_SECONDS: i32 = 45;
 const KEYSEND_FINAL_CLTV_DELTA: i32 = 40;
+/// How far back to fetch requests after a reconnect.
+const RECONNECT_LOOKBACK_SECONDS: u64 = 5 * 60;
+const ENCRYPTION_SCHEMES: &str = "nip44_v2 nip04";
+
+const BAD_REQUEST: &str = "BAD_REQUEST";
+const FEE_LIMIT_EXCEEDED: &str = "FEE_LIMIT_EXCEEDED";
+const INSUFFICIENT_BALANCE: &str = "INSUFFICIENT_BALANCE";
+const INTERNAL: &str = "INTERNAL";
+const NOT_FOUND: &str = "NOT_FOUND";
+const NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
+const PAYMENT_FAILED: &str = "PAYMENT_FAILED";
+const QUOTA_EXCEEDED: &str = "QUOTA_EXCEEDED";
+const RESTRICTED: &str = "RESTRICTED";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -152,7 +165,7 @@ async fn event_loop(
     // request more than once; a replayed pay_keysend would pay again because
     // each try creates a new random preimage.
     let handled_events = Arc::new(Mutex::new(HashMap::<EventId, Instant>::new()));
-    let mut sent_info = false;
+    let mut since = Timestamp::now();
     // loop in case we get disconnected
     loop {
         let client = Client::new(keys.server_keys());
@@ -160,20 +173,15 @@ async fn event_loop(
 
         client.connect().await;
 
-        // broadcast info event
-        if !sent_info {
-            let content = advertised_methods(config).join(" ");
-            let info = EventBuilder::new(Kind::WalletConnectInfo, content)
-                .sign_with_keys(&keys.server_keys())?;
-            client.send_event(&info).await?;
-            sent_info = true;
-        }
+        // Publish the info event on every connection, in case the relay
+        // dropped it.
+        client.send_event(&info_event(config, &keys)?).await?;
 
         let subscription = Filter::new()
             .kinds(vec![Kind::WalletConnectRequest])
             .author(keys.user_keys().public_key())
             .pubkey(keys.server_keys().public_key())
-            .since(Timestamp::now());
+            .since(since);
 
         client.subscribe(subscription, None).await?;
 
@@ -202,6 +210,13 @@ async fn event_loop(
                                 let cutoff = Timestamp::now().as_secs().saturating_sub(86_400);
                                 if event.created_at.as_secs() < cutoff {
                                     debug!("Ignoring event older than 24h: {}", event.id);
+                                    continue;
+                                }
+
+                                // NIP-40: the client no longer wants an
+                                // expired request to be done.
+                                if event.is_expired() {
+                                    debug!("Ignoring expired request: {}", event.id);
                                     continue;
                                 }
 
@@ -265,7 +280,23 @@ async fn event_loop(
         }
 
         client.disconnect().await;
+
+        // A subscription that starts at "now" loses the requests that were
+        // published while we reconnect. Look back a few minutes;
+        // handled_events drops the requests that were already processed.
+        since = Timestamp::from_secs(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(RECONNECT_LOOKBACK_SECONDS),
+        );
     }
+}
+
+fn info_event(config: &Config, keys: &Nip47Keys) -> anyhow::Result<Event> {
+    let content = advertised_methods(config).join(" ");
+    Ok(EventBuilder::new(Kind::WalletConnectInfo, content)
+        .tag(Tag::parse(["encryption", ENCRYPTION_SCHEMES])?)
+        .sign_with_keys(&keys.server_keys())?)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -314,7 +345,15 @@ async fn handle_nwc_request(
     router: LndRouterClient,
 ) -> anyhow::Result<()> {
     let (decrypted, scheme) = decrypt_request_content(&keys, &event.content)?;
-    let envelope: RequestEnvelope = serde_json::from_str(&decrypted)?;
+    // From here on, every request gets a response, so the client does not
+    // wait until it times out.
+    let envelope: RequestEnvelope = match serde_json::from_str(&decrypted) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            let content = error_response("", BAD_REQUEST, format!("Invalid request: {error}"));
+            return send_json_response(&event, &keys, client, content, scheme, None).await;
+        }
+    };
     if matches!(envelope.method.as_str(), PAY_METHOD | RECEIVE_METHOD) {
         return handle_bip321_request(
             envelope.method,
@@ -331,7 +370,26 @@ async fn handle_nwc_request(
         .await;
     }
 
-    let req: Request = Request::from_json(&decrypted)?;
+    if !Method::from_str(&envelope.method).is_ok_and(|method| METHODS.contains(&method)) {
+        let content = error_response(
+            &envelope.method,
+            NOT_IMPLEMENTED,
+            format!("Method not implemented: {}", envelope.method),
+        );
+        return send_json_response(&event, &keys, client, content, scheme, None).await;
+    }
+
+    let req: Request = match Request::from_json(&decrypted) {
+        Ok(req) => req,
+        Err(error) => {
+            let content = error_response(
+                &envelope.method,
+                BAD_REQUEST,
+                format!("Invalid params: {error}"),
+            );
+            return send_json_response(&event, &keys, client, content, scheme, None).await;
+        }
+    };
 
     debug!("Request params: {:?}", req.params);
 
@@ -442,7 +500,7 @@ async fn handle_bip321_request(
         }
     };
 
-    send_json_response(event, keys, client, content, scheme).await
+    send_json_response(event, keys, client, content, scheme, None).await
 }
 
 async fn handle_bip321_pay(
@@ -467,6 +525,9 @@ async fn handle_bip321_pay(
         Ok(invoice) => invoice,
         Err(error) => return error_response(PAY_METHOD, error.code(), error.to_string()),
     };
+    if invoice.is_expired() {
+        return error_response(PAY_METHOD, BAD_REQUEST, "Invoice has expired.");
+    }
     let amount = match payment_amount(&invoice, params.amount) {
         Ok(amount) => amount,
         Err(error) => return error_response(PAY_METHOD, error.code(), error.to_string()),
@@ -500,31 +561,23 @@ async fn handle_bip321_pay(
             0
         },
         timeout_seconds: PAYMENT_TIMEOUT_SECONDS,
-        fee_limit_msat: fee_limit_msat(config.max_fee),
+        fee_limit_msat: fee_limit_msat(config.max_fee, params.max_fee),
         no_inflight_updates: true,
         allow_self_payment: false,
         ..Default::default()
     };
-    let response = match send_payment(router, request).await {
+    let result = match send_payment(router, request).await {
+        Ok(response) if response.status() == PaymentStatus::Succeeded => Ok(response),
+        Ok(response) => Err(payment_failure(&response, params.max_fee.is_some())),
+        Err(error) => Err(send_payment_error(&error, "Failed to pay invoice")),
+    };
+    let response = match result {
         Ok(response) => response,
         Err(error) => {
             tracker.lock().await.remove_payment(amount);
-            return error_response(
-                PAY_METHOD,
-                "PAYMENT_FAILED",
-                format!("Failed to pay invoice: {error}"),
-            );
+            return error_response(PAY_METHOD, error.code, error.message);
         }
     };
-
-    if response.status != PaymentStatus::Succeeded as i32 {
-        tracker.lock().await.remove_payment(amount);
-        return error_response(
-            PAY_METHOD,
-            "PAYMENT_FAILED",
-            payment_failure_message(&response),
-        );
-    }
 
     let settled_at = Timestamp::now().as_secs();
     let fees_paid = response.fee_msat.max(0) as u64;
@@ -599,9 +652,11 @@ async fn send_json_response(
     client: &Client,
     content: Value,
     scheme: Encryption,
+    d_tag: Option<Tag>,
 ) -> anyhow::Result<()> {
     let encrypted = encrypt_content(scheme, keys, &content.to_string())?;
-    let tags = vec![Tag::public_key(event.pubkey), Tag::event(event.id)];
+    let mut tags = vec![Tag::public_key(event.pubkey), Tag::event(event.id)];
+    tags.extend(d_tag);
     let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
         .tags(tags)
         .sign_with_keys(&keys.server_keys())?;
@@ -609,20 +664,62 @@ async fn send_json_response(
     Ok(())
 }
 
-async fn handle_get_info(
-    event: &Event,
-    keys: &Nip47Keys,
+/// An NWC error response.
+#[derive(Debug)]
+struct NwcError {
+    code: &'static str,
+    message: String,
+}
+
+impl NwcError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        NwcError {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+fn lnd_error(context: &str, status: tonic::Status) -> NwcError {
+    NwcError::new(INTERNAL, format!("{context}: {}", status.message()))
+}
+
+fn is_permission_denied(status: &tonic::Status) -> bool {
+    // LND reports a missing macaroon permission as an unknown error.
+    status.code() == tonic::Code::PermissionDenied
+        || status
+            .message()
+            .to_ascii_lowercase()
+            .contains("permission denied")
+}
+
+fn is_invoice_not_found(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::NotFound
+        || status
+            .message()
+            .to_ascii_lowercase()
+            .contains("unable to locate invoice")
+}
+
+async fn get_info_response(
     config: &Config,
-    client: &Client,
     lnd: &mut LndLightningClient,
-    scheme: Encryption,
-) -> anyhow::Result<()> {
+) -> Result<Value, NwcError> {
     let lnd_info = if config.recv_only() {
         None
     } else {
-        Some(lnd.get_info(GetInfoRequest {}).await?.into_inner())
+        match lnd.get_info(GetInfoRequest {}).await {
+            Ok(info) => Some(info.into_inner()),
+            // A least-privilege macaroon may not have info:read. Answer
+            // without the node fields.
+            Err(status) if is_permission_denied(&status) => {
+                debug!("get_info not permitted: {status}");
+                None
+            }
+            Err(status) => return Err(lnd_error("Failed to get node info", status)),
+        }
     };
-    let content = success_response(
+    Ok(success_response(
         Method::GetInfo.as_str(),
         ExtendedGetInfoResult {
             alias: lnd_info.as_ref().map(|info| info.alias.clone()),
@@ -634,8 +731,7 @@ async fn handle_get_info(
             methods: advertised_methods(config),
             notifications: Vec::new(),
         },
-    );
-    send_json_response(event, keys, client, content, scheme).await
+    ))
 }
 
 async fn handle_nwc_params(
@@ -650,342 +746,356 @@ async fn handle_nwc_params(
     mut router: LndRouterClient,
     scheme: Encryption,
 ) -> anyhow::Result<()> {
-    let mut d_tag: Option<Tag> = None;
-
-    if check_nwc_permissions(config, method) && matches!(&params, RequestParams::GetInfo) {
-        return handle_get_info(event, keys, config, client, &mut lnd, scheme).await;
-    }
+    let d_tag = match &params {
+        RequestParams::PayInvoice(params) => params.id.clone().map(Tag::identifier),
+        RequestParams::PayKeysend(params) => params.id.clone().map(Tag::identifier),
+        _ => None,
+    };
 
     let content = if !check_nwc_permissions(config, method) {
-        Response {
-            result_type: method,
-            error: Some(NIP47Error {
-                code: ErrorCode::Restricted,
-                message: "Method not allowed.".to_string(),
-            }),
-            result: None,
-        }
+        error_response(method.as_str(), RESTRICTED, "Method not allowed.")
     } else {
-        match params {
-            RequestParams::PayInvoice(params) => {
-                d_tag = params.id.map(Tag::identifier);
-
-                let invoice = Bolt11Invoice::from_str(&params.invoice)
-                    .map_err(|_| anyhow!("Failed to parse invoice"))?;
-                let msats = invoice
-                    .amount_milli_satoshis()
-                    .or(params.amount)
-                    .unwrap_or(0);
-
-                // Atomically check limits and reserve the amount
-                let error_msg = {
-                    let mut tracker_guard = tracker.lock().await;
-                    if config.max_amount > 0 && msats > config.max_amount * 1_000 {
-                        Some("Invoice amount too high.")
-                    } else if config.daily_limit > 0
-                        && tracker_guard.sum_payments() + msats > config.daily_limit * 1_000
-                    {
-                        Some("Daily limit exceeded.")
-                    } else {
-                        tracker_guard.add_payment(msats);
-                        None
-                    }
-                };
-
-                // verify amount, convert to msats
-                match error_msg {
-                    None => match pay_invoice(invoice, &mut router, method, config.max_fee).await {
-                        Ok(content) => {
-                            if content.error.is_some() {
-                                tracker.lock().await.remove_payment(msats);
-                            }
-                            content
-                        }
-                        Err(e) => {
-                            error!("Error paying invoice: {e}");
-                            tracker.lock().await.remove_payment(msats);
-
-                            Response {
-                                result_type: method,
-                                error: Some(NIP47Error {
-                                    code: ErrorCode::InsufficientBalance,
-                                    message: format!("Failed to pay invoice: {e}"),
-                                }),
-                                result: None,
-                            }
-                        }
-                    },
-                    Some(err_msg) => Response {
-                        result_type: method,
-                        error: Some(NIP47Error {
-                            code: ErrorCode::QuotaExceeded,
-                            message: err_msg.to_string(),
-                        }),
-                        result: None,
-                    },
-                }
-            }
-            RequestParams::PayKeysend(params) => {
-                d_tag = params.id.map(Tag::identifier);
-
-                let msats = params.amount;
-                // Validate the pubkey before any budget is reserved. A bad
-                // pubkey must not hold the reserved amount for a day.
-                match bitcoin::secp256k1::PublicKey::from_str(&params.pubkey) {
-                    Err(_) => Response {
-                        result_type: method,
-                        error: Some(NIP47Error {
-                            code: ErrorCode::Other,
-                            message: format!("Invalid pubkey: {}", params.pubkey),
-                        }),
-                        result: None,
-                    },
-                    Ok(pubkey) => {
-                        // Atomically check limits and reserve the amount
-                        let error_msg = {
-                            let mut tracker_guard = tracker.lock().await;
-                            if config.max_amount > 0 && msats > config.max_amount * 1_000 {
-                                Some("Invoice amount too high.")
-                            } else if config.daily_limit > 0
-                                && tracker_guard.sum_payments() + msats > config.daily_limit * 1_000
-                            {
-                                Some("Daily limit exceeded.")
-                            } else {
-                                tracker_guard.add_payment(msats);
-                                None
-                            }
-                        };
-
-                        // verify amount, convert to msats
-                        match error_msg {
-                            None => {
-                                match pay_keysend(
-                                    pubkey,
-                                    params.preimage,
-                                    params.tlv_records,
-                                    msats,
-                                    &mut router,
-                                    method,
-                                    config.max_fee,
-                                )
-                                .await
-                                {
-                                    Ok(content) => {
-                                        if content.error.is_some() {
-                                            tracker.lock().await.remove_payment(msats);
-                                        }
-                                        content
-                                    }
-                                    Err(e) => {
-                                        error!("Error paying keysend: {e}");
-                                        tracker.lock().await.remove_payment(msats);
-
-                                        Response {
-                                            result_type: method,
-                                            error: Some(NIP47Error {
-                                                code: ErrorCode::PaymentFailed,
-                                                message: format!("Failed to pay keysend: {e}"),
-                                            }),
-                                            result: None,
-                                        }
-                                    }
-                                }
-                            }
-                            Some(err_msg) => Response {
-                                result_type: method,
-                                error: Some(NIP47Error {
-                                    code: ErrorCode::QuotaExceeded,
-                                    message: err_msg.to_string(),
-                                }),
-                                result: None,
-                            },
-                        }
-                    }
-                }
-            }
-            RequestParams::MakeInvoice(params) => {
-                let amount = params.amount;
-                let expiry = params.expiry.unwrap_or(86_400);
-                let description = params.description;
-                let description_hash_hex = params.description_hash;
-                let description_hash: Vec<u8> = match &description_hash_hex {
-                    None => vec![],
-                    Some(value) => FromHex::from_hex(value)?,
-                };
-                let inv = Invoice {
-                    memo: description.clone().unwrap_or_default(),
-                    description_hash,
-                    value_msat: amount as i64,
-                    expiry: expiry as i64,
-                    private: config.route_hints,
-                    ..Default::default()
-                };
-                let created_at = Timestamp::now();
-                let res = lnd.add_invoice(inv).await?.into_inner();
-
-                info!("Created invoice: {}", res.payment_request);
-
-                Response {
-                    result_type: method,
-                    error: None,
-                    result: Some(ResponseResult::MakeInvoice(MakeInvoiceResponse {
-                        invoice: res.payment_request,
-                        payment_hash: Some(::hex::encode(res.r_hash)),
-                        description,
-                        description_hash: description_hash_hex,
-                        preimage: None,
-                        amount: Some(amount),
-                        created_at: Some(created_at),
-                        expires_at: Some(Timestamp::from_secs(
-                            created_at.as_secs().saturating_add(expiry),
-                        )),
-                    })),
-                }
-            }
-            RequestParams::LookupInvoice(params) => {
-                let mut invoice: Option<Bolt11Invoice> = None;
-                let payment_hash: Vec<u8> = match params.payment_hash {
-                    None => match params.invoice {
-                        None => return Err(anyhow!("Missing payment_hash or invoice")),
-                        Some(bolt11) => {
-                            let inv = Bolt11Invoice::from_str(&bolt11)
-                                .map_err(|_| anyhow!("Failed to parse invoice"))?;
-                            invoice = Some(inv.clone());
-                            inv.payment_hash().to_byte_array().to_vec()
-                        }
-                    },
-                    Some(str) => FromHex::from_hex(&str)?,
-                };
-
-                let res = lnd
-                    .lookup_invoice(PaymentHash {
-                        r_hash: payment_hash.clone(),
-                        ..Default::default()
-                    })
-                    .await?
-                    .into_inner();
-
-                info!("Looked up invoice: {}", res.payment_request);
-
-                let (description, description_hash) = match invoice {
-                    Some(inv) => match inv.description() {
-                        Bolt11InvoiceDescriptionRef::Direct(desc) => (Some(desc.to_string()), None),
-                        Bolt11InvoiceDescriptionRef::Hash(hash) => (None, Some(hash.0.to_string())),
-                    },
-                    None => (None, None),
-                };
-
-                let preimage = if res.r_preimage.is_empty() {
-                    None
-                } else {
-                    Some(hex::encode(res.r_preimage))
-                };
-
-                let settled_at = if res.settle_date == 0 {
-                    None
-                } else {
-                    Some(Timestamp::from_secs(res.settle_date as u64))
-                };
-                let state = match res.state {
-                    1 => Some(TransactionState::Settled),
-                    2 => Some(TransactionState::Expired),
-                    _ => Some(TransactionState::Pending),
-                };
-
-                Response {
-                    result_type: method,
-                    error: None,
-                    result: Some(ResponseResult::LookupInvoice(LookupInvoiceResponse {
-                        transaction_type: Some(TransactionType::Incoming),
-                        state,
-                        invoice: Some(res.payment_request),
-                        description,
-                        description_hash,
-                        preimage,
-                        payment_hash: hex::encode(payment_hash),
-                        amount: res.value_msat as u64,
-                        fees_paid: 0,
-                        created_at: Timestamp::from_secs(res.creation_date as u64),
-                        expires_at: Some(Timestamp::from_secs(
-                            (res.creation_date + res.expiry) as u64,
-                        )),
-                        settled_at,
-                        metadata: Default::default(),
-                    })),
-                }
-            }
-            RequestParams::GetBalance => {
-                let balance: u64 = if config.recv_only() {
-                    // fetch local balance from lnd
-                    let channel_balance_response = lnd
-                        .channel_balance(ChannelBalanceRequest {})
-                        .await?
-                        .into_inner();
-                    let channel_balance = channel_balance_response
-                        .local_balance
-                        .unwrap_or_default()
-                        .sat;
-                    (channel_balance * 1_000) as u64
-                } else {
-                    // calculate remaining balance based on daily limit
-                    let tracker = tracker.lock().await.sum_payments();
-                    (config.daily_limit * 1_000).saturating_sub(tracker)
-                };
-
-                info!("Current balance: {balance} msats");
-
-                Response {
-                    result_type: method,
-                    error: None,
-                    result: Some(ResponseResult::GetBalance(GetBalanceResponse { balance })),
-                }
-            }
-            RequestParams::GetInfo => {
-                let lnd_info = if config.recv_only() {
-                    None
-                } else {
-                    Some(lnd.get_info(GetInfoRequest {}).await?.into_inner())
-                };
-                info!("Getting info");
-                Response {
-                    result_type: method,
-                    error: None,
-                    result: Some(ResponseResult::GetInfo(GetInfoResponse {
-                        alias: lnd_info.as_ref().map(|info| info.alias.clone()),
-                        color: lnd_info.as_ref().map(|info| info.color.clone()),
-                        pubkey: lnd_info.as_ref().map(|info| info.identity_pubkey.clone()),
-                        network: Some(config.nwc_network_name().to_string()),
-                        block_height: lnd_info.as_ref().map(|info| info.block_height),
-                        block_hash: lnd_info.as_ref().map(|info| info.block_hash.clone()),
-                        methods: methods(config),
-                        notifications: Vec::new(),
-                    })),
-                }
-            }
-            _ => {
-                return Err(anyhow!("Command not supported"));
-            }
+        match nwc_response(params, method, config, tracker, &mut lnd, &mut router).await {
+            Ok(content) => content,
+            Err(error) => error_response(method.as_str(), error.code, error.message),
         }
     };
 
-    let encrypted = encrypt_content(scheme, keys, &content.as_json())?;
-    let p_tag = Tag::public_key(event.pubkey);
-    let e_tag = Tag::event(event.id);
-    let tags = match d_tag {
-        None => vec![p_tag, e_tag],
-        Some(d_tag) => vec![p_tag, e_tag, d_tag],
-    };
-    let response = EventBuilder::new(Kind::WalletConnectResponse, encrypted)
-        .tags(tags)
-        .sign_with_keys(&keys.server_keys())?;
-
-    client.send_event(&response).await?;
-
-    Ok(())
+    send_json_response(event, keys, client, content, scheme, d_tag).await
 }
 
-fn fee_limit_msat(max_fee_sats: u64) -> i64 {
-    max_fee_sats.saturating_mul(1_000).min(i64::MAX as u64) as i64
+async fn nwc_response(
+    params: RequestParams,
+    method: Method,
+    config: &Config,
+    tracker: Arc<Mutex<PaymentTracker>>,
+    lnd: &mut LndLightningClient,
+    router: &mut LndRouterClient,
+) -> Result<Value, NwcError> {
+    let result = match params {
+        RequestParams::PayInvoice(params) => {
+            let invoice = Bolt11Invoice::from_str(&params.invoice)
+                .map_err(|_| NwcError::new(BAD_REQUEST, "Failed to parse invoice"))?;
+            let msats = invoice
+                .amount_milli_satoshis()
+                .or(params.amount)
+                .unwrap_or(0);
+
+            reserve_payment(config, &tracker, msats).await?;
+            match pay_invoice(invoice, router, config.max_fee).await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracker.lock().await.remove_payment(msats);
+                    return Err(error);
+                }
+            }
+        }
+        RequestParams::PayKeysend(params) => {
+            let msats = params.amount;
+            // Validate the request before any budget is reserved. A bad
+            // request must not hold the reserved amount for a day.
+            let pubkey = bitcoin::secp256k1::PublicKey::from_str(&params.pubkey).map_err(|_| {
+                NwcError::new(BAD_REQUEST, format!("Invalid pubkey: {}", params.pubkey))
+            })?;
+            let request = keysend_request(
+                &pubkey,
+                params.preimage,
+                params.tlv_records,
+                msats,
+                config.max_fee,
+            )
+            .map_err(|e| NwcError::new(BAD_REQUEST, e.to_string()))?;
+
+            reserve_payment(config, &tracker, msats).await?;
+            match pay_keysend(request, &pubkey, msats, router).await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracker.lock().await.remove_payment(msats);
+                    return Err(error);
+                }
+            }
+        }
+        RequestParams::MakeInvoice(params) => {
+            let amount = params.amount;
+            let expiry = params.expiry.unwrap_or(86_400);
+            let description = params.description;
+            let description_hash_hex = params.description_hash;
+            let description_hash: Vec<u8> = match &description_hash_hex {
+                None => vec![],
+                Some(value) => FromHex::from_hex(value)
+                    .map_err(|_| NwcError::new(BAD_REQUEST, "Invalid description_hash"))?,
+            };
+            let inv = Invoice {
+                memo: description.clone().unwrap_or_default(),
+                description_hash,
+                value_msat: amount as i64,
+                expiry: expiry as i64,
+                private: config.route_hints,
+                ..Default::default()
+            };
+            let created_at = Timestamp::now();
+            let res = lnd
+                .add_invoice(inv)
+                .await
+                .map_err(|e| lnd_error("Failed to create invoice", e))?
+                .into_inner();
+
+            info!("Created invoice: {}", res.payment_request);
+
+            ResponseResult::MakeInvoice(MakeInvoiceResponse {
+                invoice: res.payment_request,
+                payment_hash: Some(::hex::encode(res.r_hash)),
+                description,
+                description_hash: description_hash_hex,
+                preimage: None,
+                amount: Some(amount),
+                created_at: Some(created_at),
+                expires_at: Some(Timestamp::from_secs(
+                    created_at.as_secs().saturating_add(expiry),
+                )),
+            })
+        }
+        RequestParams::LookupInvoice(params) => {
+            let mut invoice: Option<Bolt11Invoice> = None;
+            let payment_hash: Vec<u8> = match params.payment_hash {
+                None => match params.invoice {
+                    None => {
+                        return Err(NwcError::new(
+                            BAD_REQUEST,
+                            "Missing payment_hash or invoice",
+                        ))
+                    }
+                    Some(bolt11) => {
+                        let inv = Bolt11Invoice::from_str(&bolt11)
+                            .map_err(|_| NwcError::new(BAD_REQUEST, "Failed to parse invoice"))?;
+                        let hash = inv.payment_hash().to_byte_array().to_vec();
+                        invoice = Some(inv);
+                        hash
+                    }
+                },
+                Some(str) => <[u8; 32]>::from_hex(&str)
+                    .map_err(|_| NwcError::new(BAD_REQUEST, "Invalid payment_hash"))?
+                    .to_vec(),
+            };
+
+            let lookup = lnd
+                .lookup_invoice(PaymentHash {
+                    r_hash: payment_hash.clone(),
+                    ..Default::default()
+                })
+                .await;
+            let response = match lookup {
+                Ok(res) => {
+                    let res = res.into_inner();
+                    info!("Looked up invoice: {}", res.payment_request);
+                    incoming_lookup_response(res, &payment_hash, invoice.as_ref())
+                }
+                Err(status) if is_invoice_not_found(&status) => {
+                    // Not one of our invoices; it can be a payment we sent.
+                    // A receive-only node has no outgoing payments.
+                    let payment = if config.recv_only() {
+                        None
+                    } else {
+                        lookup_payment(router, &payment_hash).await?
+                    };
+                    match payment {
+                        Some(payment) => outgoing_lookup_response(&payment),
+                        None => return Err(NwcError::new(NOT_FOUND, "Invoice not found")),
+                    }
+                }
+                Err(status) => return Err(lnd_error("Failed to look up invoice", status)),
+            };
+
+            ResponseResult::LookupInvoice(response)
+        }
+        RequestParams::GetBalance => {
+            let balance: u64 = if config.recv_only() {
+                // fetch local balance from lnd
+                let channel_balance_response = lnd
+                    .channel_balance(ChannelBalanceRequest {})
+                    .await
+                    .map_err(|e| lnd_error("Failed to get balance", e))?
+                    .into_inner();
+                let channel_balance = channel_balance_response
+                    .local_balance
+                    .unwrap_or_default()
+                    .sat;
+                (channel_balance * 1_000) as u64
+            } else {
+                // calculate remaining balance based on daily limit
+                let tracker = tracker.lock().await.sum_payments();
+                (config.daily_limit * 1_000).saturating_sub(tracker)
+            };
+
+            info!("Current balance: {balance} msats");
+
+            ResponseResult::GetBalance(GetBalanceResponse { balance })
+        }
+        RequestParams::GetInfo => return get_info_response(config, lnd).await,
+        _ => return Err(NwcError::new(NOT_IMPLEMENTED, "Method not implemented")),
+    };
+
+    let response = Response {
+        result_type: method,
+        error: None,
+        result: Some(result),
+    };
+    serde_json::to_value(response).map_err(|e| NwcError::new(INTERNAL, e.to_string()))
+}
+
+/// Atomically check the payment limits and reserve the amount.
+async fn reserve_payment(
+    config: &Config,
+    tracker: &Mutex<PaymentTracker>,
+    msats: u64,
+) -> Result<(), NwcError> {
+    let mut tracker = tracker.lock().await;
+    if config.max_amount > 0 && msats > config.max_amount.saturating_mul(1_000) {
+        Err(NwcError::new(QUOTA_EXCEEDED, "Invoice amount too high."))
+    } else if config.daily_limit > 0
+        && tracker.sum_payments().saturating_add(msats) > config.daily_limit.saturating_mul(1_000)
+    {
+        Err(NwcError::new(QUOTA_EXCEEDED, "Daily limit exceeded."))
+    } else {
+        tracker.add_payment(msats);
+        Ok(())
+    }
+}
+
+fn invoice_description(invoice: &Bolt11Invoice) -> (Option<String>, Option<String>) {
+    match invoice.description() {
+        Bolt11InvoiceDescriptionRef::Direct(desc) => (Some(desc.to_string()), None),
+        Bolt11InvoiceDescriptionRef::Hash(hash) => (None, Some(hash.0.to_string())),
+    }
+}
+
+fn incoming_lookup_response(
+    res: Invoice,
+    payment_hash: &[u8],
+    invoice: Option<&Bolt11Invoice>,
+) -> LookupInvoiceResponse {
+    let (description, description_hash) = invoice.map(invoice_description).unwrap_or_default();
+
+    let preimage = if res.r_preimage.is_empty() {
+        None
+    } else {
+        Some(hex::encode(res.r_preimage))
+    };
+
+    let settled_at = if res.settle_date == 0 {
+        None
+    } else {
+        Some(Timestamp::from_secs(res.settle_date as u64))
+    };
+    let state = match res.state {
+        1 => Some(TransactionState::Settled),
+        2 => Some(TransactionState::Expired),
+        _ => Some(TransactionState::Pending),
+    };
+
+    LookupInvoiceResponse {
+        transaction_type: Some(TransactionType::Incoming),
+        state,
+        invoice: Some(res.payment_request),
+        description,
+        description_hash,
+        preimage,
+        payment_hash: hex::encode(payment_hash),
+        amount: res.value_msat as u64,
+        fees_paid: 0,
+        created_at: Timestamp::from_secs(res.creation_date as u64),
+        expires_at: Some(Timestamp::from_secs(
+            (res.creation_date + res.expiry) as u64,
+        )),
+        settled_at,
+        metadata: Default::default(),
+    }
+}
+
+/// Look up an outgoing payment. Returns `None` if no payment with this hash
+/// exists.
+async fn lookup_payment(
+    router: &mut LndRouterClient,
+    payment_hash: &[u8],
+) -> Result<Option<Payment>, NwcError> {
+    // The first update holds the current state. Do not set
+    // no_inflight_updates: for a pending payment, the first update would
+    // then only come when the payment resolves.
+    let request = TrackPaymentRequest {
+        payment_hash: payment_hash.to_vec(),
+        no_inflight_updates: false,
+    };
+    let first_update = match router.track_payment_v2(request).await {
+        Ok(updates) => updates.into_inner().message().await,
+        Err(status) => Err(status),
+    };
+    match first_update {
+        Ok(payment) => Ok(payment),
+        Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+        Err(status) => Err(lnd_error("Failed to look up payment", status)),
+    }
+}
+
+fn nanos_to_timestamp(nanos: i64) -> Timestamp {
+    Timestamp::from_secs(nanos.max(0) as u64 / 1_000_000_000)
+}
+
+fn outgoing_lookup_response(payment: &Payment) -> LookupInvoiceResponse {
+    let state = match payment.status() {
+        PaymentStatus::Succeeded => TransactionState::Settled,
+        PaymentStatus::Failed => TransactionState::Failed,
+        _ => TransactionState::Pending,
+    };
+
+    let invoice = Some(payment.payment_request.clone()).filter(|inv| !inv.is_empty());
+    let parsed = invoice
+        .as_deref()
+        .and_then(|inv| Bolt11Invoice::from_str(inv).ok());
+    let (description, description_hash) =
+        parsed.as_ref().map(invoice_description).unwrap_or_default();
+
+    // LND returns an all-zero preimage for payments that did not settle.
+    let preimage = Some(payment.payment_preimage.clone())
+        .filter(|preimage| preimage.bytes().any(|b| b != b'0'));
+
+    let settled_at = if state == TransactionState::Settled {
+        payment
+            .htlcs
+            .iter()
+            .filter(|htlc| htlc.status() == HtlcStatus::Succeeded)
+            .map(|htlc| htlc.resolve_time_ns)
+            .max()
+            .filter(|nanos| *nanos > 0)
+            .map(nanos_to_timestamp)
+    } else {
+        None
+    };
+
+    LookupInvoiceResponse {
+        transaction_type: Some(TransactionType::Outgoing),
+        state: Some(state),
+        invoice,
+        description,
+        description_hash,
+        preimage,
+        payment_hash: payment.payment_hash.clone(),
+        amount: payment.value_msat.max(0) as u64,
+        fees_paid: payment.fee_msat.max(0) as u64,
+        created_at: nanos_to_timestamp(payment.creation_time_ns),
+        expires_at: parsed
+            .and_then(|inv| inv.expires_at())
+            .map(|expires_at| Timestamp::from_secs(expires_at.as_secs())),
+        settled_at,
+        metadata: None,
+    }
+}
+
+/// The routing fee limit: the configured limit in sats, lowered to the
+/// limit the client requested in msats, if any.
+fn fee_limit_msat(max_fee_sats: u64, requested_max_fee_msat: Option<u64>) -> i64 {
+    let limit = max_fee_sats.saturating_mul(1_000);
+    let limit = requested_max_fee_msat.map_or(limit, |requested| limit.min(requested));
+    limit.min(i64::MAX as u64) as i64
 }
 
 fn payment_failure_message(payment: &Payment) -> &'static str {
@@ -999,6 +1109,54 @@ fn payment_failure_message(payment: &Payment) -> &'static str {
         PaymentFailureReason::FailureReasonInsufficientBalance => "Insufficient local balance.",
         PaymentFailureReason::FailureReasonCanceled => "Payment was canceled.",
         PaymentFailureReason::FailureReasonNone => "Payment failed.",
+    }
+}
+
+/// The error for a failed payment. Failures where LND did not send an HTLC
+/// get a specific code, so the client knows that nothing was sent.
+/// `fee_limited` is true if the client set a fee limit.
+fn payment_failure(payment: &Payment, fee_limited: bool) -> NwcError {
+    let attempted = !payment.htlcs.is_empty();
+    let code = match payment.failure_reason() {
+        PaymentFailureReason::FailureReasonInsufficientBalance if !attempted => {
+            INSUFFICIENT_BALANCE
+        }
+        PaymentFailureReason::FailureReasonNoRoute if fee_limited && !attempted => {
+            FEE_LIMIT_EXCEEDED
+        }
+        _ => PAYMENT_FAILED,
+    };
+    let message = if code == FEE_LIMIT_EXCEEDED {
+        "No route was found within the fee limit."
+    } else {
+        payment_failure_message(payment)
+    };
+    NwcError::new(code, message)
+}
+
+/// The error for a payment that LND did not finish. LND rejects some
+/// payments before it routes them; these get a specific code. Any other
+/// error keeps PAYMENT_FAILED, because the payment state is not known.
+fn send_payment_error(error: &anyhow::Error, context: &str) -> NwcError {
+    let code = error
+        .downcast_ref::<tonic::Status>()
+        .and_then(pre_routing_error_code)
+        .unwrap_or(PAYMENT_FAILED);
+    NwcError::new(code, format!("{context}: {error}"))
+}
+
+fn pre_routing_error_code(status: &tonic::Status) -> Option<&'static str> {
+    let message = status.message().to_ascii_lowercase();
+    if message.contains("insufficient") && message.contains("balance") {
+        Some(INSUFFICIENT_BALANCE)
+    } else if message.contains("invoice expired")
+        || message.contains("already paid")
+        || message.contains("payment is in transition")
+        || status.code() == tonic::Code::InvalidArgument
+    {
+        Some(BAD_REQUEST)
+    } else {
+        None
     }
 }
 
@@ -1025,88 +1183,57 @@ async fn send_payment(
 async fn pay_invoice(
     ln_invoice: Bolt11Invoice,
     router: &mut LndRouterClient,
-    method: Method,
     max_fee_sats: u64,
-) -> anyhow::Result<Response> {
+) -> Result<ResponseResult, NwcError> {
     debug!("paying invoice: {ln_invoice}");
+
+    if ln_invoice.is_expired() {
+        return Err(NwcError::new(BAD_REQUEST, "Invoice has expired."));
+    }
 
     let req = SendPaymentRequest {
         payment_request: ln_invoice.to_string(),
         timeout_seconds: PAYMENT_TIMEOUT_SECONDS,
-        fee_limit_msat: fee_limit_msat(max_fee_sats),
+        fee_limit_msat: fee_limit_msat(max_fee_sats, None),
         no_inflight_updates: true,
         allow_self_payment: false,
         ..Default::default()
     };
 
-    let response = send_payment(router, req).await?;
+    let response = send_payment(router, req)
+        .await
+        .map_err(|e| send_payment_error(&e, "Failed to pay invoice"))?;
+    if response.status() != PaymentStatus::Succeeded {
+        return Err(payment_failure(&response, false));
+    }
 
-    let response = match response.status() {
-        PaymentStatus::Succeeded => {
-            info!("paid invoice: {}", ln_invoice.payment_hash());
-
-            Response {
-                result_type: method,
-                error: None,
-                result: Some(ResponseResult::PayInvoice(PayInvoiceResponse {
-                    preimage: response.payment_preimage,
-                    fees_paid: Some(response.fee_msat.max(0) as u64),
-                })),
-            }
-        }
-        PaymentStatus::Failed => Response {
-            result_type: method,
-            error: Some(NIP47Error {
-                code: ErrorCode::PaymentFailed,
-                message: payment_failure_message(&response).to_string(),
-            }),
-            result: None,
-        },
-        _ => unreachable!("send_payment only returns terminal payment states"),
-    };
-
-    Ok(response)
+    info!("paid invoice: {}", ln_invoice.payment_hash());
+    Ok(ResponseResult::PayInvoice(PayInvoiceResponse {
+        preimage: response.payment_preimage,
+        fees_paid: Some(response.fee_msat.max(0) as u64),
+    }))
 }
 
 async fn pay_keysend(
-    pubkey: bitcoin::secp256k1::PublicKey,
-    preimage: Option<String>,
-    tlv_records: Vec<KeysendTLVRecord>,
+    request: SendPaymentRequest,
+    pubkey: &bitcoin::secp256k1::PublicKey,
     amount_msats: u64,
     router: &mut LndRouterClient,
-    method: Method,
-    max_fee_sats: u64,
-) -> anyhow::Result<Response> {
+) -> Result<ResponseResult, NwcError> {
     debug!("paying keysend to {pubkey} for {amount_msats}msats");
 
-    let req = keysend_request(&pubkey, preimage, tlv_records, amount_msats, max_fee_sats)?;
-    let response = send_payment(router, req).await?;
+    let response = send_payment(router, request)
+        .await
+        .map_err(|e| send_payment_error(&e, "Failed to pay keysend"))?;
+    if response.status() != PaymentStatus::Succeeded {
+        return Err(payment_failure(&response, false));
+    }
 
-    let response = match response.status() {
-        PaymentStatus::Succeeded => {
-            info!("paid keysend to {pubkey} for {amount_msats}msats");
-
-            Response {
-                result_type: method,
-                error: None,
-                result: Some(ResponseResult::PayKeysend(PayKeysendResponse {
-                    preimage: response.payment_preimage,
-                    fees_paid: Some(response.fee_msat.max(0) as u64),
-                })),
-            }
-        }
-        PaymentStatus::Failed => Response {
-            result_type: method,
-            error: Some(NIP47Error {
-                code: ErrorCode::PaymentFailed,
-                message: payment_failure_message(&response).to_string(),
-            }),
-            result: None,
-        },
-        _ => unreachable!("send_payment only returns terminal payment states"),
-    };
-
-    Ok(response)
+    info!("paid keysend to {pubkey} for {amount_msats}msats");
+    Ok(ResponseResult::PayKeysend(PayKeysendResponse {
+        preimage: response.payment_preimage,
+        fees_paid: Some(response.fee_msat.max(0) as u64),
+    }))
 }
 
 fn keysend_request(
@@ -1143,7 +1270,7 @@ fn keysend_request(
             .map_err(|_| anyhow!("keysend amount is out of range"))?,
         final_cltv_delta: KEYSEND_FINAL_CLTV_DELTA,
         timeout_seconds: PAYMENT_TIMEOUT_SECONDS,
-        fee_limit_msat: fee_limit_msat(max_fee_sats),
+        fee_limit_msat: fee_limit_msat(max_fee_sats, None),
         dest_custom_records,
         no_inflight_updates: true,
         allow_self_payment: false,
@@ -1341,6 +1468,160 @@ mod tests {
 
         let error = keysend_request(&pubkey, None, Vec::new(), u64::MAX, 1).unwrap_err();
         assert_eq!(error.to_string(), "keysend amount is out of range");
+    }
+
+    #[test]
+    fn lowers_fee_limit_to_requested_max_fee() {
+        assert_eq!(fee_limit_msat(7, None), 7_000);
+        assert_eq!(fee_limit_msat(7, Some(1_500)), 1_500);
+        assert_eq!(fee_limit_msat(7, Some(9_000)), 7_000);
+        assert_eq!(fee_limit_msat(u64::MAX, None), i64::MAX);
+    }
+
+    fn failed_payment(reason: PaymentFailureReason, attempted: bool) -> Payment {
+        Payment {
+            status: PaymentStatus::Failed as i32,
+            failure_reason: reason as i32,
+            htlcs: if attempted {
+                vec![Default::default()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn uses_pre_routing_codes_only_when_no_htlc_was_sent() {
+        let insufficient = PaymentFailureReason::FailureReasonInsufficientBalance;
+        let no_route = PaymentFailureReason::FailureReasonNoRoute;
+
+        let error = payment_failure(&failed_payment(insufficient, false), false);
+        assert_eq!(error.code, INSUFFICIENT_BALANCE);
+        let error = payment_failure(&failed_payment(insufficient, true), false);
+        assert_eq!(error.code, PAYMENT_FAILED);
+
+        let error = payment_failure(&failed_payment(no_route, false), true);
+        assert_eq!(error.code, FEE_LIMIT_EXCEEDED);
+        let error = payment_failure(&failed_payment(no_route, false), false);
+        assert_eq!(error.code, PAYMENT_FAILED);
+        let error = payment_failure(&failed_payment(no_route, true), true);
+        assert_eq!(error.code, PAYMENT_FAILED);
+
+        let timeout = PaymentFailureReason::FailureReasonTimeout;
+        let error = payment_failure(&failed_payment(timeout, true), true);
+        assert_eq!(error.code, PAYMENT_FAILED);
+    }
+
+    #[test]
+    fn maps_lnd_send_errors_to_codes() {
+        let code = |status: tonic::Status| send_payment_error(&status.into(), "Failed").code;
+
+        assert_eq!(
+            code(tonic::Status::already_exists("invoice is already paid")),
+            BAD_REQUEST
+        );
+        assert_eq!(
+            code(tonic::Status::already_exists("payment is in transition")),
+            BAD_REQUEST
+        );
+        assert_eq!(
+            code(tonic::Status::unknown(
+                "invoice expired. Valid until 2026-01-01 00:00:00 +0000 UTC"
+            )),
+            BAD_REQUEST
+        );
+        assert_eq!(
+            code(tonic::Status::unknown("insufficient local balance")),
+            INSUFFICIENT_BALANCE
+        );
+        assert_eq!(
+            code(tonic::Status::unavailable("transport error")),
+            PAYMENT_FAILED
+        );
+        assert_eq!(
+            send_payment_error(&anyhow!("stream ended"), "Failed").code,
+            PAYMENT_FAILED
+        );
+    }
+
+    #[test]
+    fn detects_lnd_lookup_and_permission_errors() {
+        assert!(is_invoice_not_found(&tonic::Status::not_found(
+            "unable to locate invoice"
+        )));
+        assert!(is_invoice_not_found(&tonic::Status::unknown(
+            "unable to locate invoice"
+        )));
+        assert!(!is_invoice_not_found(&tonic::Status::unavailable("down")));
+
+        assert!(is_permission_denied(&tonic::Status::unknown(
+            "permission denied"
+        )));
+        assert!(!is_permission_denied(&tonic::Status::unavailable("down")));
+    }
+
+    #[test]
+    fn builds_outgoing_lookup_response() {
+        let settled = Payment {
+            payment_hash: "ab".repeat(32),
+            value_msat: 21_000,
+            fee_msat: 1_000,
+            payment_preimage: "cd".repeat(32),
+            status: PaymentStatus::Succeeded as i32,
+            creation_time_ns: 1_700_000_000_500_000_000,
+            htlcs: vec![tonic_openssl_lnd::lnrpc::HtlcAttempt {
+                status: HtlcStatus::Succeeded as i32,
+                resolve_time_ns: 1_700_000_010_000_000_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let response = outgoing_lookup_response(&settled);
+        assert_eq!(response.transaction_type, Some(TransactionType::Outgoing));
+        assert_eq!(response.state, Some(TransactionState::Settled));
+        assert_eq!(response.payment_hash, "ab".repeat(32));
+        assert_eq!(response.preimage, Some("cd".repeat(32)));
+        assert_eq!(response.amount, 21_000);
+        assert_eq!(response.fees_paid, 1_000);
+        assert_eq!(response.created_at, Timestamp::from_secs(1_700_000_000));
+        assert_eq!(
+            response.settled_at,
+            Some(Timestamp::from_secs(1_700_000_010))
+        );
+        assert_eq!(response.invoice, None);
+
+        let failed = Payment {
+            payment_preimage: "0".repeat(64),
+            status: PaymentStatus::Failed as i32,
+            ..Default::default()
+        };
+        let response = outgoing_lookup_response(&failed);
+        assert_eq!(response.state, Some(TransactionState::Failed));
+        assert_eq!(response.preimage, None);
+        assert_eq!(response.settled_at, None);
+
+        let pending = Payment {
+            status: PaymentStatus::InFlight as i32,
+            ..Default::default()
+        };
+        let response = outgoing_lookup_response(&pending);
+        assert_eq!(response.state, Some(TransactionState::Pending));
+    }
+
+    #[test]
+    fn info_event_advertises_encryption_schemes() {
+        let config = Config::try_parse_from(["nwc-lnd", "--relay", "wss://relay.example"]).unwrap();
+        let keys = Nip47Keys::generate();
+
+        let event = info_event(&config, &keys).unwrap();
+
+        assert_eq!(event.kind, Kind::WalletConnectInfo);
+        assert!(event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["encryption", "nip44_v2 nip04"]));
     }
 
     #[test]

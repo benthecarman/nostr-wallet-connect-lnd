@@ -17,6 +17,8 @@ pub struct PayRequestParams {
     pub payment: String,
     pub amount: Option<u64>,
     pub payer_note: Option<String>,
+    /// Maximum routing fee, in msats
+    pub max_fee: Option<u64>,
     #[serde(default, rename = "metadata")]
     pub _metadata: Option<Value>,
 }
@@ -338,6 +340,18 @@ mod tests {
         let uri = format!("bitcoin:?lno={SIGNET_OFFER}");
         let error = parse_payment_uri(&uri, Network::Signet).await.unwrap_err();
         assert_eq!(error, PaymentUriError::UnsupportedPaymentInstruction);
+    }
+
+    #[test]
+    fn parses_optional_max_fee() {
+        let params: PayRequestParams =
+            serde_json::from_value(json!({"payment": "bitcoin:?lightning=x", "max_fee": 1500}))
+                .unwrap();
+        assert_eq!(params.max_fee, Some(1_500));
+
+        let params: PayRequestParams =
+            serde_json::from_value(json!({"payment": "bitcoin:?lightning=x"})).unwrap();
+        assert_eq!(params.max_fee, None);
     }
 
     #[test]
